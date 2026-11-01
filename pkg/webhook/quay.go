@@ -1,0 +1,109 @@
+package webhook
+
+import (
+	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/argoproj-labs/argocd-image-updater/pkg/argocd"
+)
+
+type QuayWebhook struct {
+	secret string
+}
+
+func NewQuayWebhook(secret string) *QuayWebhook {
+	return &QuayWebhook{
+		secret: secret,
+	}
+}
+
+// GetRegistryType returns the type this handler supports
+func (q *QuayWebhook) GetRegistryType() string {
+	return "quay.io"
+}
+
+// Validate checks the Quay webhook payload to see if its valid
+func (q *QuayWebhook) Validate(r *http.Request) error {
+	if r.Method != http.MethodPost {
+		return fmt.Errorf("invalid HTTP method: %s", r.Method)
+	}
+
+	// Quay at the moment does not support secrets
+	// !! This query param method is NOT secure use at own risk
+	if q.secret != "" {
+		secret := r.URL.Query().Get("secret")
+		if secret == "" {
+			return fmt.Errorf("missing webhook secret")
+		}
+
+		if subtle.ConstantTimeCompare([]byte(secret), []byte(q.secret)) != 1 {
+			return fmt.Errorf("invalid webhook secret")
+		}
+	}
+
+	return nil
+}
+
+// Parse process the Quay webhook and returns a Webhook event from the event
+func (q *QuayWebhook) Parse(r *http.Request) (*argocd.WebhookEvent, error) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+
+	// Quay Repository Push Event
+	// https://docs.quay.io/guides/notifications.html
+	var payload struct {
+		Name        string   `json:"name"`
+		Repository  string   `json:"repository"`
+		Namespace   string   `json:"namespace"`
+		DockerUrl   string   `json:"docker_url"`
+		Homepage    string   `json:"homepage"`
+		UpdatedTags []string `json:"updated_tags"`
+	}
+
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("failed to parse webhook payload: %w", err)
+	}
+
+	// Check updated tags for now just take first one
+	var tag string
+	if len(payload.UpdatedTags) == 0 {
+		return nil, fmt.Errorf("no tags in the payload")
+	}
+	tag = payload.UpdatedTags[0]
+
+	registryURL := "quay.io"
+	if payload.DockerUrl != "" {
+		registryURL = extractRegistryFromDockerURL(payload.DockerUrl)
+	}
+
+	return &argocd.WebhookEvent{
+		RegistryURL: registryURL,
+		Repository:  payload.Repository,
+		Tag:         tag,
+	}, nil
+}
+
+// extractRegistryFromDockerURL extracts the registry hostname from a docker_url
+// field such as "quay.apps.example.com/namespace/repo"
+func extractRegistryFromDockerURL(dockerURL string) string {
+	raw := dockerURL
+	if !strings.HasPrefix(dockerURL, "http://") && !strings.HasPrefix(dockerURL, "https://") {
+		dockerURL = "https://" + dockerURL
+	}
+	if parsed, err := url.Parse(dockerURL); err == nil && parsed.Host != "" {
+		return parsed.Host
+	}
+	// Fallback: try to extract host manually by splitting on the first '/'
+	parts := strings.Split(raw, "/")
+	if len(parts) > 0 && strings.Contains(parts[0], ".") {
+		return parts[0]
+	}
+	return "quay.io"
+}

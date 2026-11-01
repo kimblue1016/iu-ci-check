@@ -1,0 +1,887 @@
+# Update methods
+
+## Overview
+
+Argo CD Image Updater supports several methods to propagate new versions of the
+images to Argo CD. These methods are also referred to as *write back methods*.
+
+Currently, the following methods are supported:
+
+* [argocd](#method-argocd)
+  directly modifies the Argo CD *Application* resource, using Kubernetes
+  API, depending on Argo CD Image Updater's configuration.
+
+* [git](#method-git)
+  will create a Git commit in your Application's Git repository that holds the
+  information about the image to update to.
+
+Depending on the write back method, further configuration may be possible.
+
+The write back method and its configuration can be specified at multiple levels
+in the `ImageUpdater` custom resource:
+
+* **Global level**: In `spec.writeBackConfig` - applies to all applications
+  unless overridden at the application level
+* **Per application level**: In `spec.applicationRefs[].writeBackConfig` -
+  overrides the global configuration for specific applications
+
+Application-level configuration takes precedence over global configuration.
+
+## <a name="method-argocd"></a>`argocd` write-back method
+
+The `argocd` write-back method directly modifies the Argo CD `Application` resource
+in the cluster, updating the application's source parameters (similar to what
+`argocd app set --parameter ...` would do) to instruct Argo CD to re-render the
+manifests using those parameters.
+
+This method is pseudo-persistent. If you delete the `Application` resource
+from the cluster and re-create it, changes made by Image Updater will be gone.
+The same is true if you manage your `Application` resources using Git, and
+the version stored in Git is synced over the resource in the cluster. This
+method is most suitable for Applications also created imperatively, i.e.
+using the Web UI or CLI.
+
+This method is the default and requires no further configuration.
+
+!!!note "Plugin applications"
+    For Plugin (CMP) applications using `manifestTargets.plugin`, the `argocd`
+    write-back method sets environment variables in the Application's
+    `spec.source.plugin.env` list. This works the same way as Helm parameter
+    overrides — the update is applied directly to the Application resource in
+    the cluster.
+
+## <a name="method-git"></a>`git` write-back method
+
+!!!warning "Compatibility with Argo CD"
+    The Git write-back method requires a feature in Argo CD that has been
+    introduced with Argo CD v2.0. Git write-back will not work with earlier
+    versions of Argo CD.
+
+The `git` write-back method uses Git to permanently store its parameter
+overrides along with the Application's resource manifests. This will enable
+persistent storage of the parameters in Git.
+
+By default, Argo CD Image Updater will store the parameter in a file named
+`.argocd-source-<appName>.yaml` in the path used by the Application to source
+its manifests from. This will allow Argo CD to pick up parameters in this
+file, when rendering manifests for the Application named `<appName>`. Using
+this approach will also minimize the possibility of merge conflicts, as long
+as no other party in your CI will modify this file. Helm parameters in this
+file are sorted alphabetically by name to ensure deterministic output.
+
+!!!note "A note on the application's target revision"
+    Due to the nature of how Git write-back works, your application really
+    should track a *branch* instead of a revision. If you track `HEAD`, a tag
+    or a certain revision with your application, you **must** specify the
+    branch in the `writeBackConfig.gitConfig.branch` field. But in order for
+    Argo CD to pick up the change after Image Updater has committed & pushed
+    the change, you really want to set it up so it tracks a branch.
+
+To use the Git write-back method, configure the `writeBackConfig` in your
+`ImageUpdater` custom resource:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+```
+
+In order to better decide whether this method is suitable for your use-case,
+this is the workflow how Argo CD Image Updater performs change to Git:
+
+* Fetch the remote repository from location specified by `.spec.source.repoURL`
+  in the Argo CD Application manifest, or if overridden, from the
+  `gitConfig.repository` field in the `ImageUpdater` CR, using credentials
+  specified in the `writeBackConfig.method` field
+* Check-out the target branch on the local copy. The target branch is taken
+  from the `writeBackConfig.gitConfig.branch` field in the `ImageUpdater` CR, or if not
+  specified, from the Argo CD Application manifest `.spec.source.targetRevision`
+* Create or update `.argocd-source-<appName>.yaml` in the local repository
+* Commit the changed file to the local repository
+* Push the commit to the remote repository, using credentials specified in the
+  `ImageUpdater` CR
+
+The important pieces to this workflow are:
+
+* Credentials configured in Argo CD will be re-used, unless you override with a
+  dedicated set of credentials
+
+* Write-back is a commit to the tracking branch of the Application.
+
+* If `.spec.source.targetRevision` does not reference a *branch*, you will have
+  to specify the branch to use manually (see below)
+
+### <a name="method-git-general-config"></a>General configuration
+
+Configuration for the Git write-back method comes from two sources:
+
+* The Argo CD `Application` manifest is used to define the repository and the
+  path where the `.argocd-source-<appName>.yaml` should be written to. These
+  are defined in `.spec.source.repoURL` and `.spec.source.path` fields,
+  respectively. Additionally, `.spec.source.targetRevision` is used to define
+  the branch to commit and push the changes to. The branch to use can be
+  overridden by configuration in `ImageUpdater` CR, see below.
+
+* An `ImageUpdater` CR, see below
+
+### <a name="method-git-credentials"></a>Specifying Git credentials
+
+By default, Argo CD Image Updater re-uses the credentials you have configured
+in Argo CD for accessing the repository.
+
+If you don't want to use credentials configured for Argo CD you can use other credentials stored in a Kubernetes secret,
+which needs to be accessible by the Argo CD Image Updater's Service Account. The secret should be specified in 
+the `writeBackConfig.method` field using `git:<credref>` format. Where `<credref>` might
+take one of following values:
+
+* `repocreds` (default) - Git repository credentials configured in Argo CD settings
+* `secret:<secret>` - secret name only; the secret must exist in the same namespace as the `ImageUpdater` CR.
+* `secret:<namespace>/<secret>` - fully-qualified secret reference; the namespace **must** match the namespace of the `ImageUpdater` CR.
+
+Example:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git:secret:git-creds"
+```
+
+Or with an explicit namespace (must equal the CR's namespace):
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git:secret:argocd/git-creds"
+```
+
+!!!warning "Cross-namespace secret references are rejected"
+    The `namespace/secret` format is preserved for backwards compatibility.
+    However, the namespace in the reference
+    **must** equal the namespace of the `ImageUpdater` CR. Referencing a secret
+    from a different namespace (e.g. specifying `team-b/git-creds` while the CR
+    runs in `team-a`) is rejected with an error. This prevents tenants from
+    reading secrets they do not own.
+    If no namespace is specified (plain `secret:<secret>` form), the CR's own
+    namespace is used automatically.
+
+If the repository is accessed using HTTPS, the secret must contain either user credentials or GitHub app credentials.
+
+If the repository is accessed using user credentials, the secret requires two fields
+`username` which holds the Git username, and `password` which holds the user's
+password or a private access token (PAT) with write access to the repository.
+You can generate such a secret using `kubectl`, e.g.:
+
+```bash
+kubectl -n argocd-image-updater create secret generic git-creds \
+  --from-literal=username=someuser \
+  --from-literal=password=somepassword
+```
+
+By default, TLS certificate verification is skipped for user credentials. To
+verify the server certificate against the system trust store, add
+`insecure: "false"` to the secret:
+
+```bash
+kubectl -n argocd-image-updater create secret generic git-creds \
+  --from-literal=username=someuser \
+  --from-literal=password=somepassword \
+  --from-literal=insecure=false
+```
+
+If the repository is accessed using GitHub app credentials, the secret requires three fields `githubAppID` which holds the GitHub Application ID, `githubAppInstallationID` which holds the GitHub Organization Installation ID, and `githubAppPrivateKey` which holds the GitHub Application private key. The GitHub Application must be installed into the target repository with write access.
+You can generate such a secret using `kubectl`, e.g.:
+
+```bash
+kubectl -n argocd-image-updater create secret generic git-creds \
+  --from-literal=githubAppID=applicationid \
+  --from-literal=githubAppInstallationID=installationid \
+  --from-literal=githubAppPrivateKey='-----BEGIN RSA PRIVATE KEY-----PRIVATEKEYDATA-----END RSA PRIVATE KEY-----'
+```
+
+The following optional fields are also supported for GitHub App secrets:
+
+| Secret Key | Description | Default |
+|---|---|---|
+| `githubAppEnterpriseBaseUrl` | GitHub Enterprise API base URL (e.g. `https://github.example.com/api/v3`) | empty (uses github.com) |
+| `tlsClientCertData` | PEM-encoded client certificate for mTLS | empty |
+| `tlsClientCertKey` | PEM-encoded client private key for mTLS | empty |
+| `insecure` | Skip TLS certificate verification (`"true"` or `"false"`) | `"false"` |
+| `proxy` | HTTP(S) proxy URL | empty |
+
+For example, to use a GitHub Enterprise instance:
+
+```bash
+kubectl -n argocd-image-updater create secret generic git-creds \
+  --from-literal=githubAppID=12345 \
+  --from-literal=githubAppInstallationID=67890 \
+  --from-literal=githubAppPrivateKey='-----BEGIN RSA PRIVATE KEY-----PRIVATEKEYDATA-----END RSA PRIVATE KEY-----' \
+  --from-literal=githubAppEnterpriseBaseUrl='https://github.example.com/api/v3' \
+  --from-literal=insecure='true'
+```
+
+!!!warning
+    In previous versions, TLS verification was always skipped (`insecure` was
+    hardcoded to `true`) when using secret-based GitHub App credentials. This
+    has been fixed to default to `false`, matching the behavior of repository
+    credentials configured through Argo CD settings.
+
+    If your GitHub Enterprise instance uses a self-signed or internal CA
+    certificate and you have not set `insecure` in your secret, you must either:
+
+    * Add `insecure: "true"` to your secret, or
+    * Install your CA certificate in the container's trust store
+
+If the repository is accessed using SSH, the secret must contain the field
+`sshPrivateKey`, which holds a SSH private key in OpenSSH-compatible PEM
+format. To create such a secret from an existing private key, you can use
+`kubectl`, for example:
+
+```bash
+kubectl -n argocd-image-updater create secret generic git-creds \
+  --from-file=sshPrivateKey=~/.ssh/id_rsa
+```
+
+By default, SSH host key verification is skipped for secret-based SSH
+credentials, and every push logs a warning saying so. To verify host keys,
+add `insecure: "false"` to the secret:
+
+```bash
+kubectl -n argocd-image-updater create secret generic git-creds \
+  --from-file=sshPrivateKey=~/.ssh/id_rsa \
+  --from-literal=insecure=false
+```
+
+With verification enabled, host keys are checked against the
+`argocd-ssh-known-hosts-cm` ConfigMap, which the default installation mounts
+at `/app/config/ssh`. The Git host must be listed there, or the push fails.
+Argo CD ships this ConfigMap with keys for common hosts such as GitHub and
+GitLab; add your own hosts to it as you would for Argo CD itself.
+
+!!!note
+    The optional `insecure` field defaults to `"true"` for SSH and
+    username/password secrets. This keeps existing setups working unchanged.
+    For these secrets, an invalid value keeps the default and logs a
+    warning. GitHub App secrets default to `"false"`, and an invalid value
+    there also falls back to `"false"`, without a warning.
+
+### <a name="method-git-repository"></a>Specifying a repository when using a Helm repository in repoURL
+
+By default, Argo CD Image Updater will use the value found in the Application
+spec at `.spec.source.repoURL` as Git repository to check out. But when using
+a Helm repository as `.spec.source.repoURL` GIT will simply fail. To manually
+specify the repository to push the changes, specify the
+`writeBackConfig.gitConfig.repository` field.
+
+This value will define the Git repository to use, for example the
+following would use a GitHub's repository:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      repository: "git@github.com:example/example.git"
+```
+
+### <a name="method-git-branch"></a>Specifying a branch to commit to
+
+By default, Argo CD Image Updater will use the value found in the Application
+spec at `.spec.source.targetRevision` as Git branch to check out, commit to
+and push back the changes it made. In some scenarios, this might not be what
+is desired, and you can (and maybe have to) override the branch to use by
+specifying the `writeBackConfig.gitConfig.branch` field.
+
+This value will define the Git branch to use, for example the
+following would use GitHub's default `main` branch:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      branch: "main"
+```
+
+### <a name="method-git-base-commit-branch"></a>Specifying a separate base and commit branch
+
+By default, Argo CD Image Updater will checkout, commit, and push back to the
+same branch specified above. There are many scenarios where this is not
+desired or possible, such as when the default branch is protected. You can
+add a separate write-branch by modifying the `writeBackConfig.gitConfig.branch`
+field with additional data, which will create a new branch from the base
+branch, and push to this new branch instead:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      branch: "base:target"
+```
+
+If you want to specify a write-branch but continue to use the target revision from the application
+specification, just omit the base branch name:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      branch: ":target"
+```
+
+A static branch name may not be desired for this value, so a simple template
+can be created (evaluating using the `text/template` Golang package) within
+the configuration. For example, the following would create a branch named
+`image-updater-foo/bar-1.1` based on `main` in the event an image with
+the name `foo/bar` was updated to the new tag `1.1`.
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      branch: "main:image-updater{{range .Images}}-{{.Name}}-{{.NewTag}}{{end}}"
+```
+
+Alternatively, to assure unique branch names you could use the SHA256 representation of the changes:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      branch: "main:image-updater-{{.SHA256}}"
+```
+
+The following variables are provided for this template:
+
+* `.Images` is a list of changes that were performed by the update. Each
+  entry in this list is a struct providing the following information for
+  each change:
+  * `.Name` holds the full name of the image that was updated
+  * `.Alias` holds the alias of the image that was updated
+  * `.OldTag` holds the tag name or SHA digest previous to the update
+  * `.NewTag` holds the tag name or SHA digest that was updated to
+* `.SHA256` is a unique SHA256 hash representing these changes
+* `.TargetKey` is a short hash (8 hex characters) identifying the write-back target (derived from git repo, branch, and target path)
+* `.AppNamespace` is the namespace of the application being updated
+* `.AppName` is the name of the application being updated
+
+Please note that if the output of the template exceeds 255 characters (git branch name limit) it will be truncated.
+
+### <a name="method-git-target"></a>Git Write-Back Target
+
+By default, git write-back will create or update `.argocd-source-<appName>.yaml`.
+
+If you are using Kustomize and want the image updates available for normal use with `kustomize`,
+you may set the `writeBackConfig.gitConfig.writeBackTarget` to `kustomization`. This method commits changes to the Kustomization
+file back to git as though you ran `kustomize edit set image`.
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git" # all git options are supported
+    gitConfig:
+      writeBackTarget: "kustomization"
+```
+
+You may also specify which kustomization to update with either a path relative to the project source path...
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      writeBackTarget: "kustomization:../../base"
+# if the Application spec.source.path = config/overlays/foo, this would update the kustomization in config/base
+```
+
+...or absolute with respect to the repository:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      # absolute paths start with /
+      writeBackTarget: "kustomization:/config/overlays/bar"
+```
+
+Note that the Kustomization directory needs to be specified, not a file, like when using Kustomize.
+
+If you are using Helm and want the image updates parameters available in your values files,
+you may set the `writeBackConfig.gitConfig.writeBackTarget` to `helmvalues:<full path to your values file>`. This method commits changes to the values
+file back that is used to render the Helm template.
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git" # all git options are supported
+    gitConfig:
+      writeBackTarget: "helmvalues"
+```
+
+You may also specify which helmvalues to update with either a path relative to the project source path...
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      writeBackTarget: "helmvalues:../../values.yaml"
+# if the Application spec.source.path = config/overlays/foo, this would update the helmvalues in config/base
+```
+
+...or absolute with respect to the repository:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      # absolute paths start with /
+      writeBackTarget: "helmvalues:/helm/config/test-values.yaml"
+```
+
+Note that using the helmvalues option needs the Helm values filename to be specified in the
+`writeBackConfig.gitConfig.writeBackTarget`.
+
+For Plugin applications using `manifestTargets.plugin`, the default write-back
+target is used automatically. The filename is `.argocd-source-<appName>.yaml`,
+or `.argocd-source-<namespace>_<appName>.yaml` when the Application namespace
+differs from the controller's configured namespace.
+The file will contain plugin env var overrides in a format that Argo CD merges
+into the Application source at sync time:
+
+```yaml
+# .argocd-source-myapp.yaml (generated by Image Updater)
+plugin:
+  env:
+  - name: REDIS_IMAGE_NAME
+    value: myregistry/redis
+  - name: REDIS_IMAGE_TAG
+    value: 7.0.0
+```
+
+### <a name="method-git-multi-source"></a>Multi-Source Applications (mixed Kustomize, Helm, and Plugin)
+
+Argo CD supports [multi-source applications](https://argo-cd.readthedocs.io/en/stable/user-guide/multiple_sources/) where an `Application` or `ApplicationSet` lists several sources. A common pattern is combining a Git/Kustomize source (your own workload) with one or more Helm chart sources (third-party dependencies such as Redis or PostgreSQL), or including a Plugin source alongside other source types.
+
+Image Updater handles this correctly: it identifies the correct write-back source by the `writeBackTarget` you configure and the source type detected from `Status.SourceTypes`. You only need to target the Kustomize, Helm, or Plugin source that contains your images; the other sources are left untouched.
+
+#### Kustomize + Helm example
+
+```yaml
+# ApplicationSet template
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      writeBackTarget: "kustomization"  # targets the Kustomize git source only
+```
+
+```yaml
+sources:
+  # Source 0 — your workload (Kustomize, may have no explicit kustomize: field)
+  - repoURL: 'https://github.com/your-org/gitops.git'
+    path: ./deployments/myapp/overlays/staging
+    targetRevision: main
+
+  # Source 1 — third-party Helm chart; Image Updater ignores this one
+  - repoURL: 'registry-1.docker.io/bitnamicharts'
+    chart: redis
+    targetRevision: '20.11.*'
+    helm:
+      valueFiles:
+        - $values/deployments/myapp/base/redis/values.yaml
+
+  # Source 2 — values ref; also ignored
+  - repoURL: 'https://github.com/your-org/gitops.git'
+    ref: values
+    targetRevision: main
+```
+
+Image Updater locates the Kustomize write-back source in two steps:
+
+1. It first looks for a source with an explicit `kustomize:` spec block.
+2. If none is found, it falls back to `Status.SourceTypes` index alignment — Argo CD records the detected source type for every source in that field, so an implicit Kustomize source (where Argo CD auto-detects Kustomize via a `kustomization.yaml` file in the path) is still correctly identified.
+
+This means **you do not need to add an explicit `kustomize: {}` block** to your source spec — the `write-back-target: kustomization` annotation is sufficient.
+
+!!!note "Annotation-based configuration"
+    When using the annotation API (e.g. on an `ApplicationSet` template), the equivalent configuration is:
+    ```yaml
+    argocd-image-updater.argoproj.io/write-back-method: git
+    argocd-image-updater.argoproj.io/write-back-target: kustomization
+    ```
+
+### <a name="method-git-pull-request"></a>Git Pull Request
+
+The Git Pull Request mode extends the `git` write-back method so that instead
+of pushing directly to the tracking branch, Argo CD Image Updater:
+
+1. Pushes the image update commit to an automatically generated **head branch**
+   (`image-updater-<targetKey>-<sha256>`).
+2. Opens a **pull request** or **merge request** from that head
+   branch into the configured base branch.
+
+If a pull request for the same head → base pair already exists, the controller
+treats the situation as a successful no-op and does not open a duplicate.
+When reconciling, the controller first queries the SCM provider for an existing
+open PR/MR before cloning the repository. If one is found, the entire git clone,
+commit, push, and PR/MR creation cycle is skipped, reducing unnecessary work
+while an open PR/MR already exists.
+
+#### When to use Pull Request mode
+
+Use this mode when the target branch is protected and direct pushes are
+forbidden, or when you want every image update to go through a review workflow
+before it is merged and applied by Argo CD.
+
+#### Branch configuration
+
+!!!warning "Colon branch format is not supported in PR mode"
+    The `base:target` shorthand used for [separate base and commit branches](#method-git-base-commit-branch)
+    is **not** supported when `pullRequest` is configured. Specify only the
+    **base branch** (the branch the PR will be merged into), e.g.:
+
+    ```yaml
+    gitConfig:
+      branch: "main"
+    ```
+
+    Configuring a branch value that contains a colon (`:`) together with
+    `pullRequest` is a validation error and will prevent the `ImageUpdater` CR
+    from being reconciled.
+
+The head branch (PR source) is derived automatically by the controller using
+the template `image-updater-<targetKey>-<sha256>`, where `<targetKey>` is
+an 8-character hash of the write-back target (git repo, branch, and target
+path). This ensures that multiple applications sharing the same write-back
+target and the same update set produce the same PR branch, avoiding duplicate
+pull requests.
+
+!!!warning "Breaking change in pull request branch naming"
+    The default PR head branch was previously
+    `image-updater-<appNamespace>-<appName>-<sha256>`. It is now
+    `image-updater-<targetKey>-<sha256>`. After upgrading, the first
+    reconciliation will create a new branch with the new naming scheme.
+    Any open PRs that used the old branch name will **not** be closed
+    automatically — you must close them and delete their head branches
+    manually.
+
+#### Credentials
+
+PR creation requires credentials that carry a bearer token — either a **personal
+access token (PAT)** or a **GitHub App**. SSH keys cannot be used because they
+do not provide the HTTP token needed to call the SCM API.
+
+Configure credentials via the `writeBackConfig.method` field using the
+`git:secret:<secret>` format (see
+[Specifying Git credentials](#method-git-credentials) for how to create the
+secret). The author identity of the commits and the PR is derived from those
+credentials.
+
+#### TLS for the SCM API
+
+Calls to the SCM API (opening the PR/MR, and creating signed commits through
+the GitHub API) trust the certificates for the API host in the TLS certificate
+directory used by the Git transport (`ARGOCD_TLS_DATA_PATH`, e.g. a mount of
+Argo CD's `argocd-tls-certs-cm`). They do not also need to be added to the
+system trust store, e.g. with `SSL_CERT_DIR`.
+
+TLS verification is always on for SCM API calls, regardless of the
+repository's `insecure` setting, because those calls carry the access token.
+
+#### PR title and body
+
+The pull request title is taken from the **first line** of the rendered Git
+commit message template, and the body from everything after the first newline.
+If no custom commit message template is configured the defaults are:
+
+* **Title**: `chore: update images for <namespace>/<appName>`
+* **Body**: `This pull request was created automatically by argocd-image-updater for application <namespace>/<appName>.`
+
+Titles longer than 255 characters and bodies longer than 65 536 characters are
+truncated automatically. Azure DevOps bodies are limited to 4 000 characters.
+
+To customise the title and body, configure the
+[commit message template](#method-git-commit-message).
+
+#### PR labels
+
+Set `pullRequest.labels` to apply labels to every pull/merge request opened by
+Image Updater, for example to drive review automation or merge queues:
+
+```yaml
+writeBackConfig:
+  method: "git:secret:git-creds"
+  gitConfig:
+    repository: "https://github.com/example/example.git"
+    branch: "main"
+    pullRequest:
+      github: {}
+      labels:
+        - image-update
+        - automated
+```
+
+The field applies to all providers, but they behave slightly differently:
+
+* **GitLab** sets the labels in the same API call that creates the merge
+  request, and creates any label that does not yet exist in the project.
+* **Azure DevOps** applies labels in separate API calls after creating the
+  pull request. If a call fails, a warning is logged and the remaining labels
+  are still attempted. The update is still treated as successful.
+* **Gitea** applies labels by name in a single follow-up call after creating
+  the pull request. Only labels that already exist in the repository or its
+  organization are attached. Labels by name need Gitea 1.22 or Forgejo 8 or
+  newer. If the call fails, a warning is logged and the update is still
+  treated as successful.
+* **GitHub** has no labels field on its PR creation API, so labels are applied
+  in a follow-up call once the PR exists. If that call fails (for example when
+  the token lacks issue write permission) a warning is logged and the update is
+  still treated as successful — the PR is created either way.
+
+Empty entries and duplicates are ignored.
+
+#### GitHub
+
+GitHub pull requests are supported for both github.com and GitHub Enterprise
+Server. For GitHub Enterprise the API base URL is derived automatically from the
+repository URL.
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git:secret:git-creds"
+    gitConfig:
+      repository: "https://github.com/example/example.git"
+      branch: "main"        # base branch; colon format not supported here
+      pullRequest:
+        github: {}
+```
+
+Full example with per-application override and Helm values write-back target:
+
+```yaml
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: my-image-updater
+  namespace: argocd
+spec:
+  writeBackConfig:
+    method: "git:secret:git-creds"
+    gitConfig:
+      repository: "https://github.com/example/example.git"
+      branch: "main"
+      pullRequest:
+        github: {}
+  applicationRefs:
+    - namePattern: "my-app"
+      images:
+        - alias: "nginx"
+          imageName: "nginx:1.17.10"
+      writeBackConfig:
+        method: "git:secret:git-creds"
+        gitConfig:
+          branch: "main"
+          writeBackTarget: "helmvalues:/helm/config/values.yaml"
+```
+
+#### GitLab
+
+To create a merge request on GitLab (including self-managed instances),
+add `pullRequest.gitlab` to your `gitConfig`:
+
+```yaml
+writeBackConfig:
+  method: "git:secret:gitlab-creds"
+  gitConfig:
+    repository: "https://gitlab.com/org/repo.git"
+    branch: "main"
+    writeBackTarget: "helmvalues:/helm/config/values.yaml"
+    pullRequest:
+      gitlab: {}
+```
+
+#### Azure DevOps
+
+For Azure Repos Git, configure `pullRequest.azuredevops`:
+
+```yaml
+writeBackConfig:
+  method: "git:secret:azure-devops-creds"
+  gitConfig:
+    repository: "https://dev.azure.com/organization/project/_git/repository"
+    branch: "main"
+    pullRequest:
+      azuredevops: {}
+```
+
+Supports `dev.azure.com`, `organization.visualstudio.com`, and Azure DevOps Server
+[2022.1 or newer](https://learn.microsoft.com/en-us/rest/api/azure/devops/#api-and-tfs-version-mapping).
+The API URL is derived from the repository URL, which must use HTTPS.
+
+Use an HTTPS secret with a `username` and a PAT in `password`.
+The PAT needs **Code (Read & write)** scope, and its owner must be able to push
+branches and create pull requests.
+
+#### Gitea
+
+For Gitea (and Forgejo, which keeps a compatible API), configure
+`pullRequest.gitea`:
+
+```yaml
+writeBackConfig:
+  method: "git:secret:gitea-creds"
+  gitConfig:
+    repository: "https://gitea.example.com/org/repo.git"
+    branch: "main"
+    pullRequest:
+      gitea: {}
+```
+
+The API URL is derived from the repository URL, which must use HTTP or HTTPS.
+Instances served under a sub-path (for example
+`https://example.com/gitea/org/repo.git`) are supported. Plain HTTP is meant
+for in-cluster service URLs such as `http://gitea-http.gitea.svc:3000`: the
+token is then sent unencrypted, so prefer HTTPS on any other network.
+
+Use an HTTPS secret with a `username` and an access token in `password`.
+The token needs the **write:repository** scope to push the head branch and open
+the pull request, and **write:issue** to apply labels.
+
+### <a name="method-git-commit-user"></a>Specifying the user and email address for commits
+
+Each Git commit is associated with an author's name and email address. If not
+configured, commits performed by Argo CD Image Updater will use
+`argocd-image-updater <noreply@argoproj.io>`
+as the author. You can override the author using the
+`--git-commit-user` and `--git-commit-email` command line switches or set
+`git.user` and `git.email`
+in the `argocd-image-updater-config` ConfigMap.
+
+### <a name="method-git-commit-message"></a>Changing the Git commit message
+
+You can change the default commit message used by Argo CD Image Updater to some
+message that best suites your processes and regulations. For this, a simple
+template can be created (evaluating using the `text/template` Golang package)
+and made available through setting the key `git.commit-message-template` in the
+`argocd-image-updater-config` ConfigMap to the template's contents, e.g.
+```yaml
+data:
+  git.commit-message-template: |
+    build: automatic update of {{ .AppName }}
+
+    {{ range .AppChanges -}}
+    updates image {{ .Image }} tag '{{ .OldTag }}' to '{{ .NewTag }}'
+    {{ end -}}
+```
+
+If we want a more detailed message, we can add custom labels during the build process, and use them for adding custom details to the commit messages. The example below uses OCI image labels to show the parent commit in GitHub.
+- `org.opencontainers.image.source` label showing the Git repo URL.
+- `org.opencontainers.image.revision` label showing Git commit SHA
+```yaml
+data:
+  git.commit-message-template: |
+    build: Automatic update of {{ .AppName }}
+
+    {{ range .AppChanges -}}
+    updates image {{ .Image }} tag '{{ .OldTag }}' to '{{ .NewTag }}'
+    {{- if index .Labels "org.opencontainers.image.revision" }}
+    {{- $source := index .Labels "org.opencontainers.image.source" }}
+    {{- $revision := index .Labels "org.opencontainers.image.revision" }}
+    Upstream Commit: {{ $source }}/commit/{{ $revision }}
+    {{ end }}
+    {{ end -}}
+```
+**Note:** This template assumes `org.opencontainers.image.source` contains a clean Git repository URL (e.g., `https://github.com/org/repo`) without trailing slashes or `.git` suffixes. Most container build tools automatically generate labels in this format. It also assumes that `org.opencontainers.image.revision` is provided at build time.
+
+To update the `Upstream Commit` message for different Git providers, following examples can be used.
+1. **GitLab**:    `Upstream Commit: {{ $source }}/-/commit/{{ $revision }}`.
+2. **BitBucket**:  `Upstream Commit: {{ $source }}/commits/{{ $revision }}`
+
+
+Two top-level variables are provided to the template:
+
+* `.AppName` is the name of the application that is being updated
+* `.AppChanges` is a list of changes that were performed by the update. Each
+  entry in this list is a struct providing the following information for
+  each change:
+    * `.Image` holds the full name of the image that was updated
+    * `.OldTag` holds the tag name or SHA digest previous to the update
+    * `.NewTag` holds the tag name or SHA digest that was updated to
+    * `.Labels` is a map of the labels contained in the created Docker/OCI image, and in case no labels are being assigned to created image, an empty map is created
+
+In order to test a template before configuring it for use in Image Updater,
+you can store the template you want to use in a temporary file, and then use
+the `argocd-image-updater template /path/to/file` command to render the
+template using pre-defined data and see its outcome on the terminal.
+
+## <a name="method-git-commit-signing"></a>Enabling commit signature signing using an SSH or GPG key
+
+### 1. SCM branch protection rules require signed commits
+Commit signing for SCM branch protection rules require the repository be accessed using HTTPS or SSH with a user account.
+Repositories accessed using a GitHub App can not be verified when using the git command line at this time.
+
+Each Git commit associated with an author's name and email address can be signed via a private SSH key or GPG key.
+
+Commit signing requires a bot account with a GPG or SSH key and the username and email address configured to match the bot account.
+
+Your preferred signing key must be associated with your bot account. See SCM provider documentation for further details:
+* [GitHub](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification)
+* [GitLab](https://docs.gitlab.com/ee/user/project/repository/signed_commits/)
+* [Bitbucket](https://confluence.atlassian.com/bitbucketserver/controlling-access-to-code-776639770.html)
+
+### 2. Signing commits for future use with ArgoCD Source Verification Policies
+Commits can also be signed for use with source verification.
+In this case signing keys do not need to be associated with an SCM user account.
+
+**SSH:**
+
+The private key must be mounted and accessible on the `argocd-image-updater` pod.
+
+Set `git.commit-signing-key` `argocd-image-updater-config` ConfigMap to the path of your private key:
+
+```yaml
+data:
+  git.commit-sign-off: "true"
+  git.commit-signing-key: /app/ssh-keys/id_rsa
+  git.commit-signing-method: "ssh"
+```
+
+Create a new SSH secret or use your existing SSH secret:
+```bash
+kubectl -n argocd-image-updater create secret generic ssh-git-creds \
+  --from-file=sshPrivateKey=~/.ssh/id_rsa
+```
+
+**GPG:**
+
+The GPG private key must be installed and available in the `argocd-image-updater` pod.
+The `git.commit-signing-method` defaults to `openpgp`.
+Set `git.commit-signing-key` in the `argocd-image-updater-config` ConfigMap to the GPG key ID you want to use:
+
+```yaml
+data:
+  git.commit-sign-off: "true"
+  git.commit-signing-key: 3AA5C34371567BD2
+```
+
+#### Commit Sign Off can be enabled by setting `git.commit-sign-off: "true"`
+
+### <a name="method-git-commit-method"></a>Signed commits via the GitHub API
+
+When your write-back repository uses GitHub App credentials, you can have Argo CD Image Updater create its commits through the GitHub API instead of the local git command line by setting `GIT_COMMIT_METHOD=api` (or `--git-commit-method api`). Commits created this way are authored by the GitHub App's bot user and signed by GitHub itself, so they show as **Verified** — without provisioning or rotating any GPG/SSH signing keys.
+
+This applies to both the direct push and the pull request write-back flows.
+
+Notes:
+
+* GitHub App credentials are required. Repositories using SSH or personal access token credentials fall back to the normal git command line with a warning in the log.
+* `git-commit-user`, `git-commit-email` and the `git-commit-signing-*` settings are ignored in API mode, since GitHub determines the commit author and performs the signing.
+* Works with GitHub Enterprise; the API endpoints are derived from the configured GitHub App enterprise base URL.
+* Commits are created via the GraphQL API and count against the GitHub App installation's [GraphQL rate limit](https://docs.github.com/en/graphql/overview/rate-limits-and-node-limits-for-the-graphql-api). In environments with many applications and frequent image updates, this limit can be exhausted; affected write-backs fail and are retried on the next reconciliation, and keep failing until the rate limit window resets. If you hit this, increase the update check interval (`--interval`) or spread applications across multiple GitHub App installations.

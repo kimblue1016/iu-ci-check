@@ -1,0 +1,294 @@
+package registry
+
+// Package registry implements functions for retrieving data from container
+// registries.
+//
+// TODO: Refactor this package and provide mocks for better testing.
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/distribution/distribution/v3"
+
+	"golang.org/x/sync/semaphore"
+
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/image"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/kube"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/log"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/tag"
+)
+
+const (
+	MaxMetadataConcurrency = 20
+)
+
+// ErrCredentialsInvalid is returned by GetTags when the registry responded 401/403
+// and CredsExpire is set. Callers should call SetEndpointCredentials again, create
+// a new registry client, and retry GetTags.
+var ErrCredentialsInvalid = fmt.Errorf("registry credentials invalid (401/403)")
+
+// GetTags returns a list of available tags for the given image.
+// usingEndpointCreds must be true when the RegistryClient was built from
+// endpoint-cached credentials (i.e. no per-image pull secret was provided).
+// Only in that case will a 401/403 response clear the endpoint credential cache.
+func (ep *RegistryEndpoint) GetTags(ctx context.Context, img *image.ContainerImage, regClient RegistryClient, vc *image.VersionConstraint, usingEndpointCreds bool) (*tag.ImageTagList, error) {
+	var tagList *tag.ImageTagList = tag.NewImageTagList()
+	var err error
+
+	logCtx := log.LoggerFromContext(ctx)
+
+	// Some registries have a default namespace that is used when the image name
+	// doesn't specify one. For example at Docker Hub, this is 'library'.
+	var nameInRegistry string
+	if len := len(strings.Split(img.ImageName, "/")); len == 1 && ep.DefaultNS != "" {
+		nameInRegistry = ep.DefaultNS + "/" + img.ImageName
+		logCtx.Debugf("Using canonical image name '%s' for image '%s'", nameInRegistry, img.ImageName)
+	} else {
+		nameInRegistry = img.ImageName
+	}
+	err = regClient.NewRepository(ctx, nameInRegistry)
+	if err != nil {
+		logCtx.Errorf("Failed to create repository for image '%s': %v", nameInRegistry, err)
+		return nil, err
+	}
+	tTags, err := regClient.Tags(ctx)
+	if err != nil {
+		// Only treat 401/403 as invalid cached creds when creds are still within their validity window:
+		// credsexpire is set, we got auth error, and cache has not yet expired (e.g. registry changed password).
+		// When creds are already expired, do not return ErrCredentialsInvalid; let the original error propagate.
+		ep.lock.Lock()
+		if usingEndpointCreds && ep.CredsExpire > 0 && !ep.credsExpiredByTime() && IsAuthError(ctx, err) {
+			logCtx.Infof("registry returned 401/403 with valid cached creds, clearing cache for refetch")
+			ep.Username = ""
+			ep.Password = ""
+			ep.lock.Unlock()
+			return nil, ErrCredentialsInvalid
+		}
+		ep.lock.Unlock()
+		return nil, err
+	}
+
+	tags := []string{}
+
+	// For digest strategy, we do require a version constraint
+	if vc.Strategy.NeedsVersionConstraint() && vc.Constraint == "" {
+		return nil, fmt.Errorf("cannot use update strategy 'digest' for image '%s' without a version constraint", img.Original())
+	}
+
+	// Loop through tags, removing those we do not want. If update strategy is
+	// digest, all but the constraint tag are ignored.
+	if vc.MatchFunc != nil || len(vc.IgnoreList) > 0 || vc.Strategy.WantsOnlyConstraintTag() {
+		for _, t := range tTags {
+			if (vc.MatchFunc != nil && !vc.MatchFunc(t, vc.MatchArgs)) || vc.IsTagIgnored(ctx, t) || (vc.Strategy.WantsOnlyConstraintTag() && t != vc.Constraint) {
+				logCtx.Tracef("Removing tag %s because it either didn't match defined pattern or is ignored", t)
+			} else {
+				tags = append(tags, t)
+			}
+		}
+	} else {
+		tags = tTags
+	}
+
+	// In some cases, we don't need to fetch the metadata to get the creation time
+	// stamp of from the image's meta data:
+	//
+	// - We use an update strategy other than latest or digest
+	// - The registry doesn't provide meta data and has tags sorted already
+	//
+	// We just create a dummy time stamp according to the registry's sort mode, if
+	// set.
+	if (vc.Strategy != image.StrategyNewestBuild && vc.Strategy != image.StrategyDigest) || ep.TagListSort.IsTimeSorted() {
+		for i, tagStr := range tags {
+			var ts int
+			if ep.TagListSort == TagListSortLatestFirst {
+				ts = len(tags) - i
+			} else if ep.TagListSort == TagListSortLatestLast {
+				ts = i
+			}
+			imgTag := tag.NewImageTag(tagStr, time.Unix(int64(ts), 0), "")
+			tagList.Add(imgTag)
+		}
+		return tagList, nil
+	}
+
+	sem := semaphore.NewWeighted(int64(MaxMetadataConcurrency))
+	tagListLock := &sync.RWMutex{}
+
+	var wg sync.WaitGroup
+	wg.Add(len(tags))
+
+	// Fetch the manifest for the tag -- we need v1, because it contains history
+	// information that we require.
+	i := 0
+	for _, tagStr := range tags {
+		i += 1
+		// Look into the cache first and re-use any found item. If GetTag() returns
+		// an error, we treat it as a cache miss and just go ahead to invalidate
+		// the entry.
+		if vc.Strategy.IsCacheable() {
+			imgTag, err := ep.Cache.GetTag(nameInRegistry, tagStr)
+			if err != nil {
+				logCtx.Warnf("invalid entry for %s:%s in cache, invalidating.", nameInRegistry, imgTag.TagName)
+			} else if imgTag != nil {
+				logCtx.Debugf("Cache hit for %s:%s", nameInRegistry, imgTag.TagName)
+				tagListLock.Lock()
+				tagList.Add(imgTag)
+				tagListLock.Unlock()
+				wg.Done()
+				continue
+			}
+		}
+
+		logCtx.Tracef("Getting manifest for image %s:%s (operation %d/%d)", nameInRegistry, tagStr, i, len(tags))
+
+		lockErr := sem.Acquire(ctx, 1)
+		if lockErr != nil {
+			logCtx.Warnf("could not acquire semaphore: %v", lockErr)
+			wg.Done()
+			continue
+		}
+		logCtx.Tracef("acquired metadata semaphore")
+
+		go func(tagStr string) {
+			defer func() {
+				sem.Release(1)
+				wg.Done()
+				logCtx.Tracef("released semaphore and terminated waitgroup")
+			}()
+
+			var ml distribution.Manifest
+			var err error
+
+			// We first try to fetch a V2 manifest, and if that's not available we fall
+			// back to fetching V1 manifest. If that fails also, we just skip this tag.
+			if ml, err = regClient.ManifestForTag(ctx, tagStr); err != nil {
+				logCtx.Errorf("Error fetching metadata for %s:%s - neither V1 or V2 or OCI manifest returned by registry: %v", nameInRegistry, tagStr, err)
+				return
+			}
+
+			// Parse required meta data from the manifest. The metadata contains all
+			// information needed to decide whether to consider this tag or not.
+			ti, err := regClient.TagMetadata(ctx, ml, vc.Options)
+			if err != nil {
+				logCtx.Errorf("error fetching metadata for %s:%s: %v", nameInRegistry, tagStr, err)
+				return
+			}
+			if ti == nil {
+				logCtx.Debugf("No metadata found for %s:%s", nameInRegistry, tagStr)
+				return
+			}
+
+			logCtx.Tracef("Found date %s", ti.CreatedAt.String())
+			var imgTag *tag.ImageTag
+			if vc.Strategy == image.StrategyDigest {
+				imgTag = tag.NewImageTagWithLabels(tagStr, ti.CreatedAt, fmt.Sprintf("sha256:%x", ti.Digest), ti.Labels)
+			} else {
+				imgTag = tag.NewImageTagWithLabels(tagStr, ti.CreatedAt, "", ti.Labels)
+			}
+			// Record the manifest content digest so that signature verification
+			// can skip a second manifest fetch (fast path). Skip the zero value:
+			// an all-zero digest means the TagMetadata implementation did not
+			// populate the field, and storing "sha256:000…000" would fool
+			// fetchTagSignatures into treating it as a valid cached digest and
+			// issuing a doomed referrers lookup instead of falling back to the
+			// slow path (ManifestForTag).
+			if ti.Digest != ([32]byte{}) {
+				imgTag.ManifestDigest = ti.EncodedDigest()
+			}
+			tagListLock.Lock()
+			tagList.Add(imgTag)
+			tagListLock.Unlock()
+			ep.Cache.SetTag(nameInRegistry, imgTag)
+		}(tagStr)
+	}
+
+	wg.Wait()
+	return tagList, err
+}
+
+// credsExpiredByTime returns true when cached creds are past their validity window.
+func (ep *RegistryEndpoint) credsExpiredByTime() bool {
+	return ep.Credentials != "" && !ep.CredsUpdated.IsZero() && ep.CredsExpire > 0 && time.Since(ep.CredsUpdated) >= ep.CredsExpire
+}
+
+// expireCredentials clears cached creds when past validity window.
+func (ep *RegistryEndpoint) expireCredentials() bool {
+	ep.lock.Lock()
+	defer ep.lock.Unlock()
+	if ep.credsExpiredByTime() {
+		ep.Username = ""
+		ep.Password = ""
+		return true
+	}
+	return false
+}
+
+// SetEndpointCredentials Sets endpoint credentials for this registry from a reference to a K8s secret
+func (ep *RegistryEndpoint) SetEndpointCredentials(ctx context.Context, kubeClient *kube.KubernetesClient, secretVal string) (*image.Credential, error) {
+	effectiveSource := ep.Credentials
+	if secretVal != "" {
+		effectiveSource = secretVal
+	}
+	flightKey := ep.RegistryAPI + "|" + effectiveSource
+
+	// Use singleflight to prevent concurrent credential fetching for the same registry
+	result, err, _ := credentialGroup.Do(flightKey, func() (any, error) {
+		return ep.setEndpointCredentialsInternal(ctx, kubeClient, secretVal)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(*image.Credential), nil
+}
+
+// setEndpointCredentialsInternal performs the actual credential fetching
+func (ep *RegistryEndpoint) setEndpointCredentialsInternal(ctx context.Context, kubeClient *kube.KubernetesClient, secretVal string) (*image.Credential, error) {
+	baseLogger := log.LoggerFromContext(ctx)
+	if ep.expireCredentials() {
+		baseLogger.Debugf("expired credentials for registry %s (updated:%s, expiry:%0fs)", ep.RegistryAPI, ep.CredsUpdated, ep.CredsExpire.Seconds())
+	}
+	ep.lock.RLock()
+	creds := &image.Credential{Username: ep.Username, Password: ep.Password}
+	useCachedEndpointCreds := secretVal == "" && ep.Username != "" && ep.Password != ""
+	ep.lock.RUnlock()
+	if !useCachedEndpointCreds && (ep.Credentials != "" || secretVal != "") {
+		fetchForEndpoint := secretVal == "" // caller did not pass image-specific secret; we will use ep.Credentials
+		if secretVal == "" {
+			secretVal = ep.Credentials
+		}
+		credSrc, err := image.ParseCredentialSource(secretVal, false)
+		if err != nil {
+			baseLogger.Warnf("Invalid credential reference specified: %s", secretVal)
+			return nil, err
+		}
+
+		// For fetching credentials, we must have working Kubernetes client.
+		if (credSrc.Type == image.CredentialSourcePullSecret || credSrc.Type == image.CredentialSourceSecret) && kubeClient == nil {
+			logger := log.ContextWithLogger(ctx, baseLogger.WithField("registry", ep.RegistryAPI))
+			log.LoggerFromContext(logger).Warnf("cannot use K8s credentials without Kubernetes client")
+			return nil, fmt.Errorf("could not fetch image tags")
+		}
+
+		creds, err = credSrc.FetchCredentials(ctx, ep.RegistryAPI, kubeClient)
+		if err != nil {
+			baseLogger.Warnf("Could not fetch credentials: %v", err)
+			return nil, err
+		}
+
+		// Only cache on the endpoint when creds are for the registry-level source. Image-specific
+		// pull secrets (secretVal != "" from caller) must not overwrite shared endpoint state.
+		if fetchForEndpoint {
+			ep.lock.Lock()
+			ep.CredsUpdated = time.Now()
+			ep.Username = creds.Username
+			ep.Password = creds.Password
+			ep.lock.Unlock()
+		}
+	}
+
+	return creds, nil
+}

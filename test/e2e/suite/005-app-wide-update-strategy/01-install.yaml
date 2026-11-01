@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: image-updater-e2e-005-01
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: image-updater-005-01
+  namespace: argocd-image-updater-e2e
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://10.42.0.1:30003/testdata.git
+    path: ./005-public-guestbook
+    targetRevision: HEAD
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: image-updater-e2e-005-01
+  syncPolicy:
+    automated: {}
+    retry:
+      limit: 2
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: image-updater-e2e-005-02
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: image-updater-005-02
+  namespace: argocd-image-updater-e2e
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://10.42.0.1:30003/testdata.git
+    path: ./005-public-guestbook
+    targetRevision: HEAD
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: image-updater-e2e-005-02
+  syncPolicy:
+    automated: {}
+    retry:
+      limit: 2
+
+---
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  labels:
+    app.kubernetes.io/name: image-updater
+    app.kubernetes.io/managed-by: kustomize
+  name: image-updater-005
+  namespace: argocd-image-updater-e2e
+spec:
+  applicationRefs:
+    - namePattern: "*-01"
+      images:
+        - alias: "guestbook"
+          imageName: "quay.io/dkarpele/my-guestbook:~1.0"
+          commonUpdateSettings:
+            updateStrategy: "semver"
+    - namePattern: "*-02"
+      images:
+        - alias: "guestbook"
+          imageName: "quay.io/dkarpele/my-guestbook:latest"
+          commonUpdateSettings:
+            updateStrategy: "newest-build"

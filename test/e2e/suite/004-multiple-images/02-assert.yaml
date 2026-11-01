@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: image-updater-004
+spec:
+  source:
+    kustomize:
+      images:
+      - nginx:1.17.10
+      - memcached:1.6.10
+status:
+  health:
+    status: Healthy
+  sync:
+    status: Synced
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: image-updater-e2e-004
+spec:
+  containers:
+  - image: nginx:1.17.10
+  - image: memcached:1.6.10

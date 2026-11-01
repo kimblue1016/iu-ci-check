@@ -1,0 +1,616 @@
+# Application configuration
+
+Argo CD Image Updater uses `ImageUpdater` custom resources to configure which
+Argo CD applications should be monitored for image updates and how those updates
+should be applied.
+
+This section explains how to configure `ImageUpdater` resources to manage your
+Argo CD applications.
+
+## <a name="imageupdater-cr"></a>Creating an ImageUpdater custom resource
+
+To configure Argo CD Image Updater, you create an `ImageUpdater` custom resource
+that defines which applications to monitor and how to update their images.
+
+The basic structure of an `ImageUpdater` resource looks like this:
+
+```yaml
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: my-image-updater
+  namespace: argocd
+spec:
+  applicationRefs:
+    - namePattern: "my-app-*"  # Select applications matching this pattern
+      images:
+        - alias: "nginx"
+          imageName: "nginx:1.20"
+```
+
+## <a name="application-selection"></a>Selecting applications
+
+Applications are selected using the `applicationRefs` field, which supports
+multiple selection criteria:
+
+### Name pattern matching
+
+Use the `namePattern` field to select applications by name using glob patterns:
+
+```yaml
+spec:
+  applicationRefs:
+    - namePattern: "frontend-*"  # Matches frontend-app, frontend-web, etc.
+      images:
+        - alias: "app"
+          imageName: "myregistry/frontend:latest"
+    - namePattern: "backend"     # Exact match for backend application
+      images:
+        - alias: "api"
+          imageName: "myregistry/backend:v1.0"
+```
+
+### NamePattern Specificity Rules
+
+When multiple `namePattern` rules could match the same application, the
+ImageUpdater uses a specificity-based selection algorithm to choose the
+most specific rule. This ensures predictable and deterministic behavior.
+
+#### How Specificity Works
+
+The specificity algorithm calculates a score for each `namePattern` based on
+several factors:
+
+1. **Exact matches** get the highest priority
+2. **Literal characters** in the pattern add to the score
+3. **Label selectors** add significant bonus points
+4. **Complex label selectors** get additional points
+
+#### Specificity Examples
+
+Given an application named `app-1`, here's how different patterns would be
+ranked:
+
+| Pattern         | Specificity Score | Reason                               |
+|-----------------|-------------------|--------------------------------------|
+| `app-1`         | 1,000,000+        | Exact match (highest priority)       |
+| `app-prod-*`    | ~9 points         | More literal characters than `app-*` |
+| `app-*`         | ~4 points         | Fewer literal characters             |
+| `app-?`         | ~4 points         | Single wildcard character            |
+| `app-[1234567]` | ~4 points         | Character set wildcard               |
+
+#### Label Selector Impact
+
+Label selectors significantly increase specificity:
+
+```yaml
+# This pattern will be more specific than a simple name pattern
+- namePattern: "app-*"
+  labelSelectors:
+    matchLabels:
+      environment: production
+      tier: frontend
+  images:
+    - alias: "nginx"
+      imageName: "nginx:1.20"
+```
+
+#### Complete Example
+
+```yaml
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: my-image-updater
+  namespace: argocd
+spec:
+  applicationRefs:
+    # This will be used for app-1 (most specific - exact match)
+    - namePattern: "app-1"
+      images:
+        - alias: "test1"
+          imageName: "test:1.1.0"
+
+    # This will be used for app-prod-* applications (more specific than app-*)
+    - namePattern: "app-prod-*"
+      images:
+        - alias: "nginx"
+          imageName: "nginx:1.20"
+
+    # This will be used for other app-* applications (least specific)
+    - namePattern: "app-*"
+      images:
+        - alias: "redis"
+          imageName: "redis:6.2"
+```
+
+#### Application Selection Process
+
+1. **List all applications** in the ImageUpdater CR's namespace (performed once per
+   reconciliation)
+2. **Sort applicationRefs** by specificity (most specific first)
+3. **For each application**, find the first matching rule in the sorted list
+4. **Stop at the first match** - this ensures the most specific rule is used
+
+!!!warning "Multiple ImageUpdater Resources Conflict"
+    **Important**: The current implementation does not handle conflicts between
+    multiple `ImageUpdater` CRs that target the same application. If multiple CRs
+    have `namePattern` rules that match the same application, they will
+    continuously overwrite each other's changes, causing the application to
+    "thrash" between different image versions.
+
+    For example, if you have two CRs:
+
+    - **CR-A** with `namePattern: "app-1"` and `imageName: "nginx:1.20"`
+    - **CR-B** with `namePattern: "app-*"` and `imageName: "nginx:1.21"`
+
+    Both CRs will try to manage `app-1`, causing the application to flip between
+    `nginx:1.20` and `nginx:1.21` on every reconciliation cycle.
+
+    **Workaround**: Ensure that each application is only targeted by one
+    `ImageUpdater` CR, or use more specific `namePattern` rules to avoid overlaps.
+
+    A solution for handling conflicts between multiple CRs will be implemented
+    in future versions.
+
+### Label-based selection
+
+Use `labelSelectors` to select applications based on their labels:
+
+```yaml
+spec:
+  applicationRefs:
+    - namePattern: "*"  # Match all applications
+      labelSelectors:
+        matchLabels:
+          app.kubernetes.io/part-of: "my-project"
+        matchExpressions:
+          - key: "environment"
+            operator: In
+            values: [ "production", "staging" ]
+      images:
+        - alias: "app"
+          imageName: "myregistry/myapp:stable"
+```
+
+### Combining selection criteria
+
+You can combine name patterns and label selectors for precise application
+selection:
+
+```yaml
+spec:
+  applicationRefs:
+    - namePattern: "web-*"
+      labelSelectors:
+        matchLabels:
+          tier: "frontend"
+      images:
+        - alias: "webapp"
+          imageName: "myregistry/webapp:latest"
+```
+
+### Reading configuration from Application annotations
+
+When using ApplicationSets that template image updater configuration as annotations,
+you can configure the ImageUpdater CR to read those annotations instead of
+requiring explicit `images` configuration:
+
+```yaml
+spec:
+  applicationRefs:
+    - namePattern: "*"
+      labelSelectors:
+        matchLabels:
+          image-updater: my-image-updater
+      imagesVerification:
+        cosignKey:
+          secretName: org-cosign-pubkey
+          key: cosign.pub
+      useAnnotations: true
+```
+
+When `useAnnotations` is set to `true`, **all CR-based configuration
+is ignored** (`images` including `manifestTargets` within each image, `commonUpdateSettings`,
+`writeBackConfig`). Instead, the controller reads everything from the Application's
+legacy `argocd-image-updater.argoproj.io/*` annotations. Only `namePattern` and
+`labelSelectors` are used for application selection; `imagesVerification` is still
+read from the CR and applied after a match is found.
+
+#### Required annotations
+
+The following annotation is **required** when using `useAnnotations: true`:
+
+* **`argocd-image-updater.argoproj.io/image-list`** - A comma-separated list of images to update.
+  Each image can optionally have an alias (format: `alias=image:tag` or just `image:tag`).
+  Example: `app=myregistry/myapp:v1.0`
+
+#### Optional annotations
+
+For a complete list of all available legacy annotations, please refer to the [Migration Guide](migration.md), 
+which provides detailed examples of all annotation-based configuration options.
+
+This allows a single ImageUpdater CR to manage multiple Applications generated by
+ApplicationSets, with each Application providing its own image configuration via
+annotations. This is particularly useful when you have hundreds of ApplicationSets
+generating thousands of Applications, as it avoids the need to create a separate
+ImageUpdater CR for each Application.
+
+!!!warning "Performance Consideration"
+    When using `useAnnotations: true` with `namePattern: "*"` and
+    no `labelSelectors`, the ImageUpdater will attempt to process **all Applications**
+    in the ImageUpdater CR's namespace. This can lead to performance issues if you have many
+    Applications. It is strongly recommended to use `labelSelectors` to limit the
+    scope of Applications that will be processed.
+
+## <a name="hierarchical-configuration"></a>Hierarchical configuration
+
+Configuration can be specified at multiple levels, with more specific levels
+overriding more general ones:
+
+1. **Global level** (`spec.commonUpdateSettings`, `spec.writeBackConfig`)
+2. **Application level** (`spec.applicationRefs[].commonUpdateSettings`,
+   `spec.applicationRefs[].writeBackConfig`)
+3. **Image level** (`spec.applicationRefs[].images[].commonUpdateSettings`)
+
+### Global configuration
+
+Set defaults that apply to all applications unless overridden:
+
+```yaml
+spec:
+  commonUpdateSettings:
+    updateStrategy: "semver"        # Default: "semver"
+    forceUpdate: false              # Default: false
+    allowTags: "regexp:^v[0-9]+\\.[0-9]+\\.[0-9]+$"  # Default: all tags
+    ignoreTags: [ "latest", "dev" ]   # Default: no tags ignored
+    pullSecret: ""                  # Default: no pull secret
+    platforms: [ ]                   # Default: no platform restrictions
+  writeBackConfig:
+    method: "argocd"                # Default: "argocd"
+  applicationRefs:
+    - namePattern: "*"
+      images:
+        - alias: "app"
+          imageName: "myregistry/myapp:1.0"
+```
+
+### Application-level overrides
+
+Override global settings for specific applications:
+
+```yaml
+spec:
+  commonUpdateSettings:
+    updateStrategy: "semver"
+  applicationRefs:
+    - namePattern: "production-*"
+      commonUpdateSettings:
+        updateStrategy: "newest-build"  # Override for production apps
+        forceUpdate: true
+      images:
+        - alias: "app"
+          imageName: "myregistry/myapp:stable"
+    - namePattern: "development-*"
+      images:
+        - alias: "app"
+          imageName: "myregistry/myapp:dev"
+```
+
+### Image-level overrides
+
+Override settings for specific images:
+
+```yaml
+spec:
+  commonUpdateSettings:
+    updateStrategy: "semver"
+  applicationRefs:
+    - namePattern: "*"
+      images:
+        - alias: "app"
+          imageName: "myregistry/myapp:1.0"
+          commonUpdateSettings:
+            updateStrategy: "newest-build"  # Override for this specific image
+        - alias: "database"
+          imageName: "postgres:13"
+          # Uses global semver strategy
+```
+
+## <a name="application-requirements"></a>Application requirements
+
+For Argo CD Image Updater to manage an application, the following criteria
+must be met:
+
+* The application must be of type `Helm`, `Kustomize`, or `Plugin`
+* The application must be located in the `metadata.namespace` of the ImageUpdater CR
+* The application must match at least one `applicationRef` criteria
+
+## <a name="configure-write-back"></a>Configuring the write-back method
+
+The Argo CD Image Updater supports two distinct methods on how to update images
+of an application:
+
+* *imperative*, via Argo CD API
+* *declarative*, by pushing changes to a Git repository
+
+Depending on your setup and requirements, you can choose the write-back method
+per Application, but not per image. As a rule of thumb, if you are managing
+`Application` in Git (i.e. in an *app-of-apps* setup), you most likely want
+to choose the Git write-back method.
+
+The write-back method is configured via an `ImageUpdater` resource:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "<method>"
+```
+
+Where `<method>` must be one of `argocd` (imperative) or `git` (declarative).
+
+The default used by Argo CD Image Updater is `argocd`.
+
+### Plugin source type
+
+Applications using an Argo CD [Config Management Plugin](https://argo-cd.readthedocs.io/en/stable/operator-manual/config-management-plugins/) (CMP) as their source type are fully supported. There are two approaches depending on how your plugin consumes image configuration.
+
+#### Approach 1: First-class plugin support via `manifestTargets.plugin`
+
+If your plugin reads image configuration from **environment variables** in the
+Application source (`spec.source.plugin.env`), use `manifestTargets.plugin` to
+specify which env vars to set. This works with both `argocd` and `git` write-back
+methods.
+
+With the **argocd** write-back method, updates are written directly to the
+Application's `spec.source.plugin.env` list. With the **git** write-back method,
+updates are written to the `.argocd-source-<appName>.yaml` file (or
+`.argocd-source-<namespace>_<appName>.yaml` when the Application namespace
+differs from the controller's configured namespace) in the git repository,
+which Argo CD merges into the Application source at sync time.
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "argocd"   # or "git"
+  applicationRefs:
+    - namePattern: "my-plugin-app"
+      images:
+        - alias: "redis"
+          imageName: "myregistry/redis:6.0"
+          manifestTargets:
+            plugin:
+              name: "REDIS_IMAGE_NAME"
+              tag: "REDIS_IMAGE_TAG"
+```
+
+Or, if your plugin expects the full image reference in a single env var:
+
+```yaml
+          manifestTargets:
+            plugin:
+              spec: "REDIS_IMAGE"
+```
+
+For details on configuring `manifestTargets.plugin`, see
+[Specifying plugin environment variable names](images.md#specifying-plugin-env-var-names).
+
+#### Approach 2: Plugin apps consuming Helm/Kustomize values files
+
+If your plugin consumes **Helm-style or Kustomize-style values files** from git
+(e.g. helmfile), you can use `manifestTargets.helm` or `manifestTargets.kustomize`
+with the **git** write-back method. In this case, Image Updater treats the plugin
+app as if it were a Helm or Kustomize app for write-back purposes — the plugin
+itself is responsible for reading the generated values file.
+
+Configure the write-back target explicitly to control the file format:
+
+| Target | Format written to Git |
+|--------|-----------------------|
+| `kustomization` or `kustomization:<path>` | `kustomization.yaml` (Kustomize image override) |
+| `helmvalues:<path>` | Helm values YAML |
+| *(none / default)* | `.argocd-source-<app>.yaml` (source parameter overrides) |
+
+!!!note
+    When using this approach, the `argocd` write-back method is not available
+    because Argo CD cannot override Helm or Kustomize parameters on a plugin
+    source. Only the `git` write-back method is supported.
+
+**Helmfile example** using `kustomization` write-back:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+    gitConfig:
+      repository: "https://github.com/myorg/infra.git"
+      branch: "main"
+  applicationRefs:
+    - namePattern: "my-helmfile-app.*"
+      writeBackConfig:
+        gitConfig:
+          writeBackTarget: "kustomization"
+      images:
+        - alias: img
+          imageName: "myregistry/myapp"
+          commonUpdateSettings:
+            updateStrategy: semver
+```
+
+The helmfile then reads the image tag from the generated `kustomization.yaml`
+via `readFile "kustomization.yaml" | fromYaml`.
+
+**Helm values example** with the default write-back target:
+
+```yaml
+spec:
+  writeBackConfig:
+    method: "git"
+  applicationRefs:
+    - namePattern: "my-plugin-app"
+      images:
+        - alias: "myapp"
+          imageName: "myregistry/myapp:1.0"
+          manifestTargets:
+            helm:
+              name: "image.repository"
+              tag: "image.tag"
+```
+
+## <a name="complete-example"></a>Complete example
+
+Here's a complete example that demonstrates various configuration options:
+
+```yaml
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: production-updater
+  namespace: argocd
+spec:
+  commonUpdateSettings:
+    updateStrategy: "semver"
+    forceUpdate: false
+    allowTags: "regexp:^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    ignoreTags: [ "latest", "dev", "test" ]
+  writeBackConfig:
+    method: "argocd"
+  applicationRefs:
+    - namePattern: "frontend-*"
+      labelSelectors:
+        matchLabels:
+          environment: "production"
+      commonUpdateSettings:
+        updateStrategy: "newest-build"
+        forceUpdate: true
+      writeBackConfig:
+        method: "git"
+        gitConfig:
+          repository: "git@github.com:myorg/frontend-config.git"
+          branch: "main"
+          writeBackTarget: "helmvalues:/values.yaml"
+      images:
+        - alias: "frontend"
+          imageName: "myregistry/frontend:v1.0"
+          commonUpdateSettings:
+            allowTags: "regexp:^v[0-9]+\\.[0-9]+\\.[0-9]+-prod$"
+        - alias: "nginx"
+          imageName: "nginx:1.20"
+    - namePattern: "backend"
+      images:
+        - alias: "api"
+          imageName: "myregistry/backend:v2.0"
+          commonUpdateSettings:
+            updateStrategy: "digest"
+        - alias: "database"
+          imageName: "postgres:13"
+```
+
+This configuration:
+
+- Sets global defaults for semver updates
+- Overrides frontend applications to use newest-build strategy and Git write-back
+- Uses specific update strategies for individual images
+- Combines name patterns with label selectors for precise targeting
+
+For more details on configuring images and update strategies, see the
+[Images Configuration](images.md) and [Update Strategies](../basics/update-strategies.md)
+documentation.
+
+## <a name="status"></a>Monitoring status
+
+The `ImageUpdater` CR exposes a `status` subresource that reflects the observed
+state of each resource. You can inspect it with:
+
+```bash
+kubectl get imageupdater -n argocd
+```
+
+The default output includes printer columns for quick visibility:
+
+```text
+NAME                 APPS   IMAGES   LAST CHECKED             READY
+production-updater   7      3        2026-03-02T22:10:00Z     True
+```
+
+For the full status, use:
+
+```bash
+kubectl get imageupdater production-updater -n argocd -o yaml
+```
+
+### Status fields
+
+| Field | Type | Description                                                                                       |
+|-------|------|---------------------------------------------------------------------------------------------------|
+| `observedGeneration` | int64 | The most recent `.metadata.generation` observed by the controller.                                |
+| `lastCheckedAt` | timestamp | When the controller last checked for image updates.                                               |
+| `lastUpdatedAt` | timestamp | When the controller last performed an image update. Only set when at least one image was updated. |
+| `applicationsMatched` | int32 | Number of Argo CD applications matched by this CR's selectors.                                    |
+| `imagesManaged` | int32 | Number of images eligible for update checking.                                                    |
+| `recentUpdates` | list | Image updates performed during the last update cycle (see below).                                 |
+| `conditions` | list | Standard Kubernetes conditions (see below).                                                       |
+
+### Recent updates
+
+The `recentUpdates` list records each image that was updated during the most
+recent update cycle. Each entry contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `alias` | string | The alias of the image configuration that was updated. |
+| `image` | string | The full image reference. |
+| `newVersion` | string | The new tag or digest the image was updated to. |
+| `applicationsUpdated` | int32 | Number of applications in which this image was updated. |
+| `updatedAt` | timestamp | When the update was applied. |
+| `message` | string | Human-readable description of the update action. |
+
+### Conditions
+
+The controller maintains three condition types following standard
+[Kubernetes API conventions](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties):
+
+| Condition | Meaning when `True` | Meaning when `False` |
+|-----------|-------------------|---------------------|
+| `Ready` | Last reconciliation completed successfully. | Last reconciliation failed entirely. |
+| `Reconciling` | An image update check is currently in progress. | Controller is idle, awaiting the next cycle. |
+| `Error` | Errors occurred during the last reconciliation. | No errors during the last reconciliation. |
+
+!!!note "Ready with partial errors"
+    When some applications succeed and others fail, `Ready` is `True` with
+    reason `ReconcileCompletedWithErrors`, while `Error` is also `True` with
+    reason `PartialErrors`. Check the condition messages for details.
+
+### Example status
+
+```yaml
+status:
+  observedGeneration: 5
+  lastCheckedAt: "2026-03-02T22:10:00Z"
+  lastUpdatedAt: "2026-03-02T22:12:35Z"
+  applicationsMatched: 7
+  imagesManaged: 3
+  recentUpdates:
+    - alias: "frontend-image"
+      image: "myregistry.com/myorg/frontend:v1.2.3"
+      newVersion: "v1.2.4"
+      applicationsUpdated: 2
+      updatedAt: "2026-03-02T22:12:35Z"
+      message: "Updated to latest patch via semver."
+  conditions:
+    - type: "Ready"
+      status: "True"
+      lastTransitionTime: "2026-03-02T22:10:00Z"
+      reason: "ReconcileSucceeded"
+      message: "Reconciled 7 applications, 2 images updated."
+    - type: "Reconciling"
+      status: "False"
+      lastTransitionTime: "2026-03-02T22:10:00Z"
+      reason: "Idle"
+      message: "Last check completed. Awaiting next cycle."
+    - type: "Error"
+      status: "False"
+      lastTransitionTime: "2026-03-02T22:10:00Z"
+      reason: "NoErrors"
+      message: "No errors during last reconciliation."
+```

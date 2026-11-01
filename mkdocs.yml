@@ -1,0 +1,68 @@
+
+site_name: Argo CD Image Updater
+repo_url: https://github.com/argoproj-labs/argocd-image-updater
+strict: true
+theme:
+  name: material
+  palette:
+  - media: '(prefers-color-scheme: light)'
+    primary: teal
+    scheme: default
+    toggle:
+      icon: material/brightness-7
+      name: Switch to dark mode
+  - media: '(prefers-color-scheme: dark)'
+    primary: teal
+    scheme: slate
+    toggle:
+      icon: material/brightness-4
+      name: Switch to light mode
+  font:
+    text: 'Work Sans'
+  logo: 'assets/logo.png'
+  features:
+  - content.code.copy
+markdown_extensions:
+- pymdownx.highlight:
+    anchor_linenums: true
+    line_spans: __span
+    pygments_lang_class: true
+- pymdownx.inlinehilite
+- pymdownx.snippets
+- pymdownx.superfences
+- admonition
+- tables
+- toc:
+    permalink: true
+nav:
+  - Overview: index.md
+  - Getting started:
+    - Installation: install/installation.md
+    - Testing: install/testing.md
+    - Command Line and Configuration Reference: 
+      - install/reference.md
+      - Command "completion": install/cmd/completion.md
+      - Command "help": install/cmd/help.md
+      - Command "run": install/cmd/run.md
+      - Command "template": install/cmd/template.md 
+      - Command "test": install/cmd/test.md
+      - Command "version": install/cmd/version.md
+      - Command "webhook": install/cmd/webhook.md
+  - Basics:
+    - Updating images: basics/update.md
+    - Update methods: basics/update-methods.md
+    - Update strategies: basics/update-strategies.md
+    - Authentication: basics/authentication.md
+  - Configuration: 
+    - Applications: configuration/applications.md
+    - Images: configuration/images.md
+    - Container Registries: configuration/registries.md
+    - Webhook: configuration/webhook.md
+    - Migration Guide: configuration/migration.md
+  - Contributing:
+    - Overview: contributing/start.md
+    - Developing: contributing/development.md
+    - Releasing: contributing/releasing.md    
+  - Examples: examples/index.md
+  - Releases ⧉: https://github.com/argoproj-labs/argocd-image-updater/releases
+  - Roadmap ⧉: https://github.com/argoproj-labs/argocd-image-updater/milestones

@@ -1,0 +1,861 @@
+package registry
+
+import (
+	"context"
+	"crypto/sha256"
+	stdjson "encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/argoproj/pkg/json"
+
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry/internal/client"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry/internal/client/auth"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry/internal/client/auth/challenge"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry/internal/client/transport"
+
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/log"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/options"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/tag"
+
+	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/manifest/manifestlist"
+	"github.com/distribution/distribution/v3/manifest/ocischema"
+	"github.com/distribution/distribution/v3/manifest/schema2"
+	"github.com/distribution/distribution/v3/registry/api/errcode"
+	"github.com/distribution/reference"
+
+	"github.com/opencontainers/go-digest"
+	ociv1 "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"go.uber.org/ratelimit"
+)
+
+// TODO: Check image's architecture and OS
+
+// knownMediaTypes is the list of media types we can process
+var knownMediaTypes = []string{
+	ociv1.MediaTypeImageManifest,
+	schema2.MediaTypeManifest,
+	manifestlist.MediaTypeManifestList,
+	ociv1.MediaTypeImageIndex,
+}
+
+// RegistryClient defines the methods we need for querying container registries
+//
+//go:generate go run github.com/vektra/mockery/v2@v2.53.6 --name RegistryClient --output ./mocks --outpkg mocks
+//go:generate go run github.com/vektra/mockery/v2@v2.53.6 --name Repository --srcpkg github.com/distribution/distribution/v3 --output ./mocks --outpkg mocks
+//go:generate go run github.com/vektra/mockery/v2@v2.53.6 --name Manifest --srcpkg github.com/distribution/distribution/v3 --output ./mocks --outpkg mocks
+//go:generate go run github.com/vektra/mockery/v2@v2.53.6 --name ManifestService --srcpkg github.com/distribution/distribution/v3 --output ./mocks --outpkg mocks
+//go:generate go run github.com/vektra/mockery/v2@v2.53.6 --name TagService --srcpkg github.com/distribution/distribution/v3 --output ./mocks --outpkg mocks
+//go:generate go run github.com/vektra/mockery/v2@v2.53.6 --name Limiter --srcpkg go.uber.org/ratelimit --output ./mocks --outpkg mocks
+//go:generate go run github.com/vektra/mockery/v2@v2.53.6 --name RoundTripper --srcpkg net/http --output ./mocks --outpkg mocks
+//go:generate go run github.com/vektra/mockery/v2@v2.53.6 --name Manager --srcpkg github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry/internal/client/auth/challenge --output ./mocks --outpkg mocks
+type RegistryClient interface {
+	NewRepository(ctx context.Context, nameInRepository string) error
+	Tags(ctx context.Context) ([]string, error)
+	ManifestForTag(ctx context.Context, tagStr string) (distribution.Manifest, error)
+	ManifestForDigest(ctx context.Context, dgst digest.Digest) (distribution.Manifest, error)
+	TagMetadata(ctx context.Context, manifest distribution.Manifest, opts *options.ManifestOptions) (*tag.TagInfo, error)
+	// Referrers returns the list of OCI referrer descriptors for the given
+	// manifest digest using the OCI Distribution Spec v1.1 referrers API.
+	// NewRepository must be called first.
+	Referrers(ctx context.Context, dgst digest.Digest) ([]distribution.Descriptor, error)
+
+	// BlobContent downloads the blob identified by dgst and returns its raw
+	// bytes. Used to fetch sigstore bundle blobs from signature artifacts.
+	// NewRepository must be called first.
+	BlobContent(ctx context.Context, dgst digest.Digest) ([]byte, error)
+}
+
+type NewRegistryClient func(*RegistryEndpoint, string, string) (RegistryClient, error)
+
+// Helper type for registry clients
+type registryClient struct {
+	regClient        distribution.Repository
+	endpoint         *RegistryEndpoint
+	creds            credentials
+	httpClient       *http.Client // authenticated + rate-limited, set by NewRepository
+	nameInRepository string       // set by NewRepository
+}
+
+// credentials is an implementation of distribution/V3/session struct
+// to manage registry credentials and token
+type credentials struct {
+	username      string
+	password      string
+	refreshTokens map[string]string
+}
+
+func (c credentials) Basic(url *url.URL) (string, string) {
+	return c.username, c.password
+}
+
+func (c credentials) RefreshToken(url *url.URL, service string) string {
+	return c.refreshTokens[service]
+}
+
+func (c credentials) SetRefreshToken(realm *url.URL, service, token string) {
+	if c.refreshTokens != nil {
+		c.refreshTokens[service] = token
+	}
+}
+
+// rateLimitTransport encapsulates our custom HTTP round tripper with rate
+// limiter from the endpoint.
+type rateLimitTransport struct {
+	limiter   ratelimit.Limiter
+	transport http.RoundTripper
+	endpoint  *RegistryEndpoint
+}
+
+// RoundTrip is a custom RoundTrip method with rate-limiter
+func (rlt *rateLimitTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	logCtx := log.LoggerFromContext(r.Context())
+
+	rlt.limiter.Take()
+	logCtx.Tracef("Performing HTTP %s %s", r.Method, r.URL)
+	resp, err := rlt.transport.RoundTrip(r)
+	return resp, err
+}
+
+const (
+	// tooManyRequestsMaxRetries is how many times a request answered with
+	// 429 Too Many Requests is retried before the response is returned.
+	tooManyRequestsMaxRetries = 3
+	// tooManyRequestsMaxWait caps the Retry-After a registry can ask for.
+	tooManyRequestsMaxWait = 30 * time.Second
+	// tooManyRequestsDefaultWait is used when a 429 has no usable Retry-After.
+	tooManyRequestsDefaultWait = time.Second
+)
+
+// tooManyRequestsRetryTransport retries GET and HEAD requests that the
+// registry answers with 429 Too Many Requests, after waiting for the
+// response's Retry-After. A tag list is fetched page by page, so without
+// this a single throttled page fails the whole listing. Requests with a body
+// are not retried, since the body would already be consumed.
+type tooManyRequestsRetryTransport struct {
+	base http.RoundTripper
+}
+
+// RoundTrip performs the request, retrying it on 429 Too Many Requests.
+func (t *tooManyRequestsRetryTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if (r.Method != http.MethodGet && r.Method != http.MethodHead) || (r.Body != nil && r.Body != http.NoBody) {
+		return t.base.RoundTrip(r)
+	}
+	for attempt := 1; ; attempt++ {
+		resp, err := t.base.RoundTrip(r)
+		if err != nil || resp.StatusCode != http.StatusTooManyRequests || attempt > tooManyRequestsMaxRetries {
+			return resp, err
+		}
+		wait := retryAfter(resp.Header.Get("Retry-After"), time.Now())
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		log.LoggerFromContext(r.Context()).Debugf("Registry returned 429 for %s %s, retrying in %s (retry %d of %d)",
+			r.Method, r.URL, wait, attempt, tooManyRequestsMaxRetries)
+		timer := time.NewTimer(wait)
+		select {
+		case <-r.Context().Done():
+			timer.Stop()
+			return nil, r.Context().Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// retryAfter returns how long a Retry-After header value asks to wait, in
+// either of its forms (seconds or an HTTP date), capped at
+// tooManyRequestsMaxWait.
+func retryAfter(value string, now time.Time) time.Duration {
+	wait := tooManyRequestsDefaultWait
+	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+		wait = time.Duration(seconds) * time.Second
+	} else if at, err := http.ParseTime(value); err == nil {
+		wait = at.Sub(now)
+	}
+	return min(max(wait, 0), tooManyRequestsMaxWait)
+}
+
+// challengeRetryTransport learns authentication challenges from real
+// repository responses instead of only from the /v2/ ping.
+//
+// The docker/distribution auth flow assumes a registry's /v2/ root advertises
+// the same authentication requirements as its repositories: NewRepository
+// pings /v2/ once, records whatever WWW-Authenticate challenge comes back, and
+// endpointAuthorizer attaches credentials to later requests only if a
+// challenge was recorded for that endpoint. Registries such as zot can be
+// configured to serve /v2/ anonymously while still requiring authentication on
+// individual repositories. Those answer the ping with 200 and no challenge, so
+// nothing is ever recorded and the configured credentials are never sent --
+// every tag and manifest read fails with "unauthorized: authentication
+// required".
+//
+// This round tripper closes that gap: when a repository request comes back 401
+// with a WWW-Authenticate header and no challenge is yet known for the
+// endpoint, it records the challenge and replays the request once. The replay
+// goes back through endpointAuthorizer, which now finds the challenge and
+// applies the matching handler. Credentials are therefore only ever sent to a
+// registry that asked for them, and whatever scheme the registry names is
+// honoured, so this covers Bearer as well as Basic.
+type challengeRetryTransport struct {
+	base    http.RoundTripper
+	manager challenge.Manager
+	creds   credentials
+	// root is the endpoint's own /v2/ API root. Challenges are learned only for
+	// this exact root, never for a host a request was redirected to. Blob reads
+	// on large registries redirect to object storage under paths that can
+	// themselves contain "/v2/" (the distribution S3 layout is
+	// /docker/registry/v2/blobs/...), and a signed-URL rejection there must
+	// never cause registry credentials to be replayed at a third party.
+	root url.URL
+}
+
+// RoundTrip implements http.RoundTripper.
+func (crt *challengeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := crt.base.RoundTrip(req)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
+	}
+	if len(challenge.ResponseChallenges(resp)) == 0 {
+		return resp, nil
+	}
+	// Replaying a request that has a body requires GetBody to rewind it. Every
+	// call this client makes is a bodyless GET, so this only guards against
+	// future callers.
+	if req.Body != nil && req.GetBody == nil {
+		return resp, nil
+	}
+
+	pingURL, ok := v2RootURL(req.URL)
+	if !ok || pingURL != crt.root {
+		return resp, nil
+	}
+
+	logCtx := log.LoggerFromContext(req.Context())
+
+	// A challenge was already known for this endpoint, so endpointAuthorizer
+	// acted on it and the registry still said no. That is a genuine
+	// authentication failure rather than a discovery gap, and retrying would
+	// only double the request count for every unauthorized repository.
+	if known, kerr := crt.manager.GetChallenges(pingURL); kerr != nil || len(known) > 0 {
+		return resp, nil
+	}
+
+	usable, rawUsable := crt.satisfiableChallenges(resp)
+	if len(usable) == 0 {
+		return resp, nil
+	}
+
+	// challenge.simpleManager keys challenges by the responding request's path
+	// verbatim, while endpointAuthorizer looks them up under that path
+	// truncated at /v2/. Re-key the response so the two agree, carrying only the
+	// schemes this client can answer.
+	header := make(http.Header, 1)
+	for _, raw := range rawUsable {
+		header.Add("WWW-Authenticate", raw)
+	}
+	if aerr := crt.manager.AddResponse(&http.Response{
+		StatusCode: resp.StatusCode,
+		Header:     header,
+		Request:    &http.Request{URL: &pingURL},
+	}); aerr != nil {
+		logCtx.Debugf("Could not record authentication challenge for %s: %v", pingURL.String(), aerr)
+		return resp, nil
+	}
+
+	if pingURL.Scheme != "https" {
+		for _, c := range usable {
+			if c.Scheme == "basic" {
+				logCtx.Warnf("Registry %s requested HTTP Basic authentication over an unencrypted connection, credentials will be sent in cleartext", pingURL.Host)
+			}
+		}
+	}
+
+	// Drain and close the 401 so the underlying connection can be reused, then
+	// replay. A clone is used so the inner transport does not overwrite the
+	// bookkeeping it keyed on the original request.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+
+	retryReq := req.Clone(req.Context())
+	if req.GetBody != nil {
+		body, berr := req.GetBody()
+		if berr != nil {
+			return nil, berr
+		}
+		retryReq.Body = body
+	}
+	logCtx.Debugf("Learned authentication challenge from %s, retrying with credentials", req.URL)
+	return crt.base.RoundTrip(retryReq)
+}
+
+// satisfiableChallenges returns the offered challenges this client can actually
+// answer, together with the raw WWW-Authenticate lines that produced them.
+//
+// Filtering has to happen before the challenges are recorded, not after.
+// endpointAuthorizer runs the handler for every recorded challenge and aborts
+// the whole request on the first handler error, so a Basic challenge recorded
+// with no credentials to answer it sinks the replay before it reaches the wire
+// -- even when a Bearer challenge offered alongside it would have succeeded
+// anonymously -- and replaces the registry's own "unauthorized" with an opaque
+// "no basic auth credentials".
+func (crt *challengeRetryTransport) satisfiableChallenges(resp *http.Response) ([]challenge.Challenge, []string) {
+	var (
+		usable []challenge.Challenge
+		raw    []string
+	)
+	for _, line := range resp.Header.Values("WWW-Authenticate") {
+		header := make(http.Header, 1)
+		header.Set("WWW-Authenticate", line)
+		// The parser yields at most one challenge per header line, so keeping
+		// the line is equivalent to keeping the challenge it parsed to.
+		for _, c := range challenge.ResponseChallenges(&http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     header,
+		}) {
+			if !crt.canSatisfy(c) {
+				continue
+			}
+			usable = append(usable, c)
+			raw = append(raw, line)
+		}
+	}
+	return usable, raw
+}
+
+// canSatisfy reports whether an offered scheme can be answered with what this
+// client holds. Bearer is always worth attempting: token services routinely
+// issue anonymous pull tokens.
+func (crt *challengeRetryTransport) canSatisfy(c challenge.Challenge) bool {
+	if c.Scheme != "basic" {
+		return true
+	}
+	return crt.creds.username != "" && crt.creds.password != ""
+}
+
+// v2RootURL returns the /v2/ API root for a registry request URL. It mirrors
+// the truncation that endpointAuthorizer.ModifyRequest performs, so the key it
+// produces is the one challenges are looked up under.
+func v2RootURL(u *url.URL) (url.URL, bool) {
+	path := u.Path
+	if v2Root := strings.Index(path, "/v2/"); v2Root != -1 {
+		path = path[:v2Root+4]
+	} else if v1Root := strings.Index(path, "/v1/"); v1Root != -1 {
+		path = path[:v1Root] + "/v2/"
+	} else {
+		return url.URL{}, false
+	}
+	return url.URL{Scheme: u.Scheme, Host: u.Host, Path: path}, true
+}
+
+// getTokenActions returns the list of OAuth2 Bearer token actions to request
+// for the given registry API. Extend this function when a registry requires
+// additional scopes beyond the default "pull".
+func getTokenActions(registryAPI string) []string {
+	switch {
+
+	// ACR endpoints require additional metadata_read and content_read actions
+	case strings.Contains(registryAPI, ".azurecr.io"):
+		return []string{"pull", "metadata_read", "content_read"}
+
+	// default registry actions
+	default:
+		return []string{"pull"}
+	}
+}
+
+// NewRepository is a wrapper for creating a registry client that is possibly
+// rate-limited by using a custom HTTP round tripper method.
+func (clt *registryClient) NewRepository(ctx context.Context, nameInRepository string) error {
+	urlToCall := strings.TrimSuffix(clt.endpoint.RegistryAPI, "/")
+	challengeManager1 := challenge.NewSimpleManager()
+	_, err := ping(ctx, challengeManager1, clt.endpoint, "")
+	if err != nil {
+		return err
+	}
+
+	actions := getTokenActions(clt.endpoint.RegistryAPI)
+
+	authTransport := transport.NewTransport(
+		clt.endpoint.GetTransport(ctx), auth.NewAuthorizer(
+			challengeManager1,
+			auth.NewTokenHandler(clt.endpoint.GetTransport(ctx), clt.creds, nameInRepository, actions...),
+			auth.NewBasicHandler(clt.creds)))
+
+	rlt := &rateLimitTransport{
+		limiter:   clt.endpoint.Limiter,
+		transport: authTransport,
+		endpoint:  clt.endpoint,
+	}
+
+	named, err := reference.WithName(nameInRepository)
+	if err != nil {
+		return err
+	}
+
+	// Registries that serve /v2/ anonymously never produce a challenge at ping
+	// time, so learn from the repository responses as well. This wraps the
+	// rate limiter rather than sitting under it, so a replayed request also
+	// takes a rate-limit token. The same holds for a request retried after a
+	// 429 Too Many Requests.
+	pingURL, err := url.Parse(urlToCall + "/v2/")
+	if err != nil {
+		return err
+	}
+	authRT := &challengeRetryTransport{
+		base:    &tooManyRequestsRetryTransport{base: rlt},
+		manager: challengeManager1,
+		creds:   clt.creds,
+		root:    url.URL{Scheme: pingURL.Scheme, Host: pingURL.Host, Path: pingURL.Path},
+	}
+
+	clt.regClient, err = client.NewRepository(named, urlToCall, authRT)
+	if err != nil {
+		return err
+	}
+	// Store the authenticated HTTP client for use by Referrers and any other
+	// raw-HTTP calls that the distribution ManifestService doesn't cover.
+	clt.httpClient = &http.Client{Transport: authRT}
+	// Keep the plain repository path so Referrers can build the correct URL.
+	clt.nameInRepository = nameInRepository
+	return nil
+}
+
+// NewClient returns a new RegistryClient for the given endpoint information
+func NewClient(endpoint *RegistryEndpoint, username, password string) (RegistryClient, error) {
+	if username == "" && endpoint.Username != "" {
+		username = endpoint.Username
+	}
+	if password == "" && endpoint.Password != "" {
+		password = endpoint.Password
+	}
+	creds := credentials{
+		username: username,
+		password: password,
+	}
+	return &registryClient{
+		creds:    creds,
+		endpoint: endpoint,
+	}, nil
+}
+
+// Tags returns a list of tags for given name in repository
+func (clt *registryClient) Tags(ctx context.Context) ([]string, error) {
+	tagService := clt.regClient.Tags(ctx)
+	tTags, err := tagService.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return tTags, nil
+}
+
+// ManifestForTag returns a Manifest for a given tag in repository
+func (clt *registryClient) ManifestForTag(ctx context.Context, tagStr string) (distribution.Manifest, error) {
+	manService, err := clt.regClient.Manifests(ctx)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := manService.Get(
+		ctx,
+		digest.FromString(tagStr),
+		distribution.WithTag(tagStr), distribution.WithManifestMediaTypes(knownMediaTypes))
+	if err != nil {
+		return nil, err
+	}
+	return manifest, nil
+}
+
+// ManifestForDigest  returns a Manifest for a given digest in repository
+func (clt *registryClient) ManifestForDigest(ctx context.Context, dgst digest.Digest) (distribution.Manifest, error) {
+	manService, err := clt.regClient.Manifests(ctx)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := manService.Get(
+		ctx,
+		dgst,
+		distribution.WithManifestMediaTypes(knownMediaTypes))
+	if err != nil {
+		return nil, err
+	}
+	return manifest, nil
+}
+
+// TagMetadata retrieves metadata for a given manifest of given repository.
+func (clt *registryClient) TagMetadata(ctx context.Context, manifest distribution.Manifest, opts *options.ManifestOptions) (*tag.TagInfo, error) {
+	ti := &tag.TagInfo{}
+	logCtx := log.LoggerFromContext(ctx)
+	var info struct {
+		Arch    string `json:"architecture"`
+		Created string `json:"created"`
+		OS      string `json:"os"`
+		Variant string `json:"variant"`
+		Config  struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"config"`
+	}
+
+	// We support the following types of manifests as returned by the registry:
+	//
+	// V2 and OCI
+	//
+	// Also ManifestLists (e.g. on multi-arch images) are supported.
+	//
+	switch deserialized := manifest.(type) {
+
+	case *manifestlist.DeserializedManifestList:
+		var list manifestlist.DeserializedManifestList = *deserialized
+
+		// List must contain at least one image manifest
+		if len(list.Manifests) == 0 {
+			return nil, fmt.Errorf("empty manifestlist not supported")
+		}
+
+		// We use the SHA from the manifest list to let the container engine
+		// decide which image to pull, in case of multi-arch clusters.
+		_, mBytes, err := list.Payload()
+		if err != nil {
+			return nil, fmt.Errorf("could not retrieve manifestlist payload: %v", err)
+		}
+		ti.Digest = sha256.Sum256(mBytes)
+
+		logCtx.Tracef("SHA256 of manifest parent is %v", ti.EncodedDigest())
+
+		return TagInfoFromReferences(ctx, clt, opts, ti, list.References())
+
+	case *ocischema.DeserializedImageIndex:
+		var index ocischema.DeserializedImageIndex = *deserialized
+
+		// Index must contain at least one image manifest
+		if len(index.Manifests) == 0 {
+			return nil, fmt.Errorf("empty index not supported")
+		}
+
+		// We use the SHA from the manifest index to let the container engine
+		// decide which image to pull, in case of multi-arch clusters.
+		_, mBytes, err := index.Payload()
+		if err != nil {
+			return nil, fmt.Errorf("could not retrieve index payload: %v", err)
+		}
+		ti.Digest = sha256.Sum256(mBytes)
+
+		logCtx.Tracef("SHA256 of manifest parent is %v", ti.EncodedDigest())
+
+		return TagInfoFromReferences(ctx, clt, opts, ti, index.References())
+
+	case *schema2.DeserializedManifest:
+		var man schema2.Manifest = deserialized.Manifest
+
+		logCtx.Tracef("Manifest digest is %v", man.Config.Digest.Encoded())
+
+		_, mBytes, err := manifest.Payload()
+		if err != nil {
+			return nil, err
+		}
+		ti.Digest = sha256.Sum256(mBytes)
+		logCtx.Tracef("v2 SHA digest is %s", ti.EncodedDigest())
+
+		// The data we require from a V2 manifest is in a blob that we need to
+		// fetch from the registry.
+		blobReader, err := clt.regClient.Blobs(ctx).Get(ctx, man.Config.Digest)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := json.Unmarshal(blobReader, &info); err != nil {
+			return nil, err
+		}
+
+		if !opts.WantsPlatform(info.OS, info.Arch, info.Variant) {
+			logCtx.Debugf("ignoring v2 manifest %v. Manifest platform: %s, requested: %s",
+				ti.EncodedDigest(), options.PlatformKey(info.OS, info.Arch, info.Variant), strings.Join(opts.Platforms(), ","))
+			return nil, nil
+		}
+
+		if ti.CreatedAt, err = time.Parse(time.RFC3339Nano, info.Created); err != nil {
+			return nil, err
+		}
+
+		ti.Labels = info.Config.Labels
+		return ti, nil
+	case *ocischema.DeserializedManifest:
+		var man ocischema.Manifest = deserialized.Manifest
+
+		_, mBytes, err := manifest.Payload()
+		if err != nil {
+			return nil, err
+		}
+		ti.Digest = sha256.Sum256(mBytes)
+		logCtx.Tracef("OCI SHA digest is %s", ti.EncodedDigest())
+
+		// The data we require from a V2 manifest is in a blob that we need to
+		// fetch from the registry.
+		blobReader, err := clt.regClient.Blobs(ctx).Get(ctx, man.Config.Digest)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := json.Unmarshal(blobReader, &info); err != nil {
+			return nil, err
+		}
+
+		if !opts.WantsPlatform(info.OS, info.Arch, info.Variant) {
+			logCtx.Debugf("ignoring OCI manifest %v. Manifest platform: %s, requested: %s",
+				ti.EncodedDigest(), options.PlatformKey(info.OS, info.Arch, info.Variant), strings.Join(opts.Platforms(), ","))
+			return nil, nil
+		}
+
+		if ti.CreatedAt, err = time.Parse(time.RFC3339Nano, info.Created); err != nil {
+			return nil, err
+		}
+
+		ti.Labels = info.Config.Labels
+		return ti, nil
+	default:
+		return nil, fmt.Errorf("invalid manifest type %T", manifest)
+	}
+}
+
+// TagInfoFromReferences is a helper method to retrieve metadata for a given
+// list of references.
+func TagInfoFromReferences(ctx context.Context, client *registryClient, opts *options.ManifestOptions, ti *tag.TagInfo, references []distribution.Descriptor) (*tag.TagInfo, error) {
+	logCtx := log.LoggerFromContext(ctx)
+	var ml []distribution.Descriptor
+	platforms := []string{}
+
+	for _, ref := range references {
+		var refOS, refArch, refVariant string
+		if ref.Platform != nil {
+			refOS = ref.Platform.OS
+			refArch = ref.Platform.Architecture
+			refVariant = ref.Platform.Variant
+		}
+		platform1 := options.PlatformKey(refOS, refArch, refVariant)
+		platforms = append(platforms, platform1)
+		logCtx.Tracef("Found %s", platform1)
+		if !opts.WantsPlatform(refOS, refArch, refVariant) {
+			logCtx.Tracef("Ignoring referenced manifest %v because platform %s does not match any of: %s",
+				ref.Digest,
+				platform1,
+				strings.Join(opts.Platforms(), ","))
+			continue
+		}
+		ml = append(ml, ref)
+	}
+
+	// We need at least one reference that matches requested platforms
+	if len(ml) == 0 {
+		logCtx.Debugf("Manifest list did not contain any usable reference. Platforms requested: (%s), platforms included: (%s)",
+			strings.Join(opts.Platforms(), ","), strings.Join(platforms, ","))
+		return nil, nil
+	}
+
+	// For some strategies, we do not need to fetch metadata for further
+	// processing.
+	if !opts.WantsMetadata() {
+		return ti, nil
+	}
+
+	// Loop through all referenced manifests to get their metadata. We only
+	// consider manifests for platforms we are interested in.
+	for _, ref := range ml {
+		logCtx.Tracef("Inspecting metadata of reference: %v", ref.Digest)
+
+		man, err := client.ManifestForDigest(ctx, ref.Digest)
+		if err != nil {
+			return nil, fmt.Errorf("could not fetch manifest %v: %v", ref.Digest, err)
+		}
+
+		cti, err := client.TagMetadata(ctx, man, opts)
+		if err != nil {
+			return nil, fmt.Errorf("could not fetch metadata for manifest %v: %v", ref.Digest, err)
+		}
+
+		// We save the timestamp of the most recent pushed manifest for any
+		// given reference, if the metadata for the tag was correctly
+		// retrieved. This is important for the latest update strategy to
+		// be able to handle multi-arch images. The latest strategy will
+		// consider the most recent reference from an image index.
+		if cti != nil {
+			if cti.CreatedAt.After(ti.CreatedAt) {
+				ti.CreatedAt = cti.CreatedAt
+				ti.Labels = cti.Labels
+			}
+		} else {
+			logCtx.Warnf("returned metadata for manifest %v is nil, this should not happen.", ref.Digest)
+			continue
+		}
+	}
+
+	return ti, nil
+}
+
+// registryErrorCode extracts the registry error code from err, along with a
+// message suitable for logging. The bool reports whether err's chain contains a
+// registry error code at all; it is false for any other error, in which case the
+// code and message are zero and must not be used. Note that the zero ErrorCode is
+// not a sentinel - it is unregistered and stringifies as "UNKNOWN", which is
+// indistinguishable from a genuine code, so callers must branch on the bool.
+//
+// Both encodings are handled: the structured errcode.Error, which carries the
+// registry's own message, and a bare errcode.ErrorCode, which is what
+// errcode.Errors.UnmarshalJSON produces for an error object that has no detail
+// and either no message or the code's canonical message. The structured form
+// must be tested first: errcode.Error does not unwrap to its Code.
+func registryErrorCode(err error) (errcode.ErrorCode, string, bool) {
+	var errcodeErr errcode.Error
+	if errors.As(err, &errcodeErr) {
+		msg := errcodeErr.Message
+		if msg == "" {
+			msg = errcodeErr.Code.Message()
+		}
+		return errcodeErr.Code, msg, true
+	}
+	var code errcode.ErrorCode
+	if errors.As(err, &code) {
+		return code, code.Message(), true
+	}
+	return 0, "", false
+}
+
+// isAuthErrorCode reports whether code denotes an authentication or
+// authorization failure.
+func isAuthErrorCode(code errcode.ErrorCode) bool {
+	return code == errcode.ErrorCodeUnauthorized || code == errcode.ErrorCodeDenied
+}
+
+// IsAuthError reports whether err is an authentication/authorization failure (401/403)
+// from the distribution registry client. It uses errors.As to detect the client's
+// typed errors and errcode instead of matching error strings. This function handles
+// both structured errcode.Error values and bare errcode.ErrorCode values to ensure
+// comprehensive authentication error detection across different registry response formats.
+func IsAuthError(ctx context.Context, err error) bool {
+	log := log.LoggerFromContext(ctx)
+	if err == nil {
+		return false
+	}
+	var u *client.UnexpectedHTTPResponseError
+	if errors.As(err, &u) {
+		if u.StatusCode == http.StatusUnauthorized || u.StatusCode == http.StatusForbidden {
+			log.Debugf("auth error from registry: HTTP %d", u.StatusCode)
+			return true
+		}
+		return false
+	}
+	var s *client.UnexpectedHTTPStatusError
+	if errors.As(err, &s) {
+		if strings.Contains(s.Status, "401") || strings.Contains(s.Status, "403") {
+			log.Debugf("auth error from registry: %s", s.Status)
+			return true
+		}
+		return false
+	}
+	// A registry may report the failure either as an errcode.Errors slice, which
+	// is what a well-formed JSON error body decodes to, or as a single unwrapped
+	// errcode value. The distribution client produces the latter for a 4xx with
+	// an empty body, a missing or non-JSON Content-Type, or a body it cannot
+	// unmarshal - all common when a proxy sits in front of the registry.
+	var errs errcode.Errors
+	if errors.As(err, &errs) {
+		for _, e := range errs {
+			if code, msg, ok := registryErrorCode(e); ok && isAuthErrorCode(code) {
+				log.Debugf("auth error from registry: %s", msg)
+				return true
+			}
+		}
+		return false
+	}
+	if code, msg, ok := registryErrorCode(err); ok && isAuthErrorCode(code) {
+		log.Debugf("auth error from registry: %s", msg)
+		return true
+	}
+	return false
+}
+
+// BlobContent implements RegistryClient.BlobContent.
+// It uses the authenticated repository's BlobStore to download the raw bytes
+// of the blob identified by dgst.
+func (clt *registryClient) BlobContent(ctx context.Context, dgst digest.Digest) ([]byte, error) {
+	if clt.regClient == nil {
+		return nil, fmt.Errorf("registry client not initialized: call NewRepository first")
+	}
+	return clt.regClient.Blobs(ctx).Get(ctx, dgst)
+}
+
+// Referrers implements RegistryClient.Referrers.
+// It calls GET /v2/<repo>/referrers/<dgst> (OCI Distribution Spec v1.1) and
+// returns all referrer descriptors.  Filter by ArtifactType on the caller's
+// side to find a specific artifact kind.
+func (clt *registryClient) Referrers(ctx context.Context, dgst digest.Digest) ([]distribution.Descriptor, error) {
+	if clt.httpClient == nil || clt.nameInRepository == "" {
+		return nil, fmt.Errorf("registry client not initialized: call NewRepository first")
+	}
+
+	rawURL := fmt.Sprintf("%s/v2/%s/referrers/%s",
+		strings.TrimSuffix(clt.endpoint.RegistryAPI, "/"),
+		clt.nameInRepository,
+		dgst.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating referrers request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.oci.image.index.v1+json")
+
+	resp, err := clt.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching referrers: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// The registry either does not support the OCI referrers API or has no
+		// referrers for this digest.  Return an empty list so the caller treats
+		// this as "no signature found" rather than a network error.
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("referrers API returned HTTP %d for digest %s", resp.StatusCode, dgst)
+	}
+
+	var result struct {
+		Manifests []distribution.Descriptor `json:"manifests"`
+	}
+	if err := stdjson.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("error decoding referrers response: %w", err)
+	}
+
+	return result.Manifests, nil
+}
+
+// Implementation of ping method to initialize the challenge list
+// Without this, tokenHandler and AuthorizationHandler won't work
+func ping(ctx context.Context, manager challenge.Manager, endpoint *RegistryEndpoint, versionHeader string) ([]auth.APIVersion, error) {
+	httpc := &http.Client{Transport: endpoint.GetTransport(ctx)}
+	url := endpoint.RegistryAPI + "/v2/"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	// Let's consider only HTTP 200 and 401 valid responses for the initial request
+	if resp.StatusCode != 200 && resp.StatusCode != 401 {
+		return nil, fmt.Errorf("endpoint %s does not seem to be a valid v2 Docker Registry API (received HTTP code %d for GET %s)", endpoint.RegistryAPI, resp.StatusCode, url)
+	}
+
+	if err := manager.AddResponse(resp); err != nil {
+		return nil, err
+	}
+
+	return auth.APIVersions(resp, versionHeader), err
+}

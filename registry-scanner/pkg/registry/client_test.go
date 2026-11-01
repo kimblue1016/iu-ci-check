@@ -1,0 +1,1536 @@
+package registry
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/distribution/distribution/v3/manifest/manifestlist"
+	"github.com/distribution/distribution/v3/manifest/ocischema"
+	"github.com/distribution/distribution/v3/manifest/schema2"
+	godigest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+
+	distclient "github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry/internal/client"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry/internal/client/auth/challenge"
+
+	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/registry/api/errcode"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"go.uber.org/ratelimit"
+
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/image"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/options"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry/mocks"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/tag"
+)
+
+func TestBasic(t *testing.T) {
+	creds := credentials{
+		username: "testuser",
+		password: "testpass",
+	}
+
+	testURL, _ := url.Parse("https://example.com")
+	username, password := creds.Basic(testURL)
+
+	if username != "testuser" {
+		t.Errorf("Expected username to be 'testuser', got '%s'", username)
+	}
+	if password != "testpass" {
+		t.Errorf("Expected password to be 'testpass', got '%s'", password)
+	}
+}
+
+// TestNewRepository_ACR_Actions tests that ACR endpoints get additional
+// metadata_read and content_read actions for OAuth2 Bearer token requests,
+// while non-ACR endpoints only request the "pull" action.
+func TestNewRepository_ACR_Actions(t *testing.T) {
+
+	t.Run("ACR endpoint includes metadata_read and content_read actions", func(t *testing.T) {
+		acrURLs := []string{
+			"https://myregistry.azurecr.io",
+			"https://test.azurecr.io",
+			"https://prod-registry.azurecr.io",
+			"https://dev.azurecr.io/v2",
+		}
+		for _, registryAPI := range acrURLs {
+			actions := getTokenActions(registryAPI)
+			assert.Equal(t, []string{"pull", "metadata_read", "content_read"}, actions,
+				"ACR endpoint %s should have pull, metadata_read, content_read actions", registryAPI)
+		}
+	})
+
+	t.Run("Non-ACR endpoint only includes pull action", func(t *testing.T) {
+		nonACRURLs := []string{
+			"https://registry-1.docker.io",
+			"https://ghcr.io",
+			"https://quay.io",
+			"https://gcr.io",
+			"https://harbor.example.com",
+			"https://registry.gitlab.com",
+		}
+		for _, registryAPI := range nonACRURLs {
+			actions := getTokenActions(registryAPI)
+			assert.Equal(t, []string{"pull"}, actions,
+				"Non-ACR endpoint %s should only have pull action", registryAPI)
+		}
+	})
+
+	t.Run("NewRepository with mock server validates non-ACR token scope", func(t *testing.T) {
+		// Mock registry server that simulates /v2/ ping with Bearer challenge
+		var capturedTokenRequest *http.Request
+		var serverURL string
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("WWW-Authenticate",
+				fmt.Sprintf(`Bearer realm="%s/oauth2/token",service="mock-registry"`, serverURL))
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+		mux.HandleFunc("/oauth2/token", func(w http.ResponseWriter, r *http.Request) {
+			capturedTokenRequest = r
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"access_token":"mock-token","expires_in":300}`)
+		})
+
+		mux.HandleFunc("/v2/test/myimage/tags/list", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"name":"test/myimage","tags":["latest"]}`)
+		})
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+
+		mockServer := httptest.NewServer(mux)
+		serverURL = mockServer.URL
+		defer mockServer.Close()
+
+		ep := &RegistryEndpoint{
+			RegistryAPI: mockServer.URL,
+			Limiter:     ratelimit.New(100),
+		}
+		client, err := NewClient(ep, "testuser", "testpass")
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "test/myimage")
+		require.NoError(t, err)
+
+		_, _ = client.Tags(context.Background())
+
+		require.NotNil(t, capturedTokenRequest, "Token request should have been captured")
+
+		scope := capturedTokenRequest.URL.Query().Get("scope")
+		assert.Contains(t, scope, "pull")
+		assert.NotContains(t, scope, "metadata_read", "Non-ACR endpoint should not request metadata_read")
+		assert.NotContains(t, scope, "content_read", "Non-ACR endpoint should not request content_read")
+	})
+
+}
+
+func TestNewRepository(t *testing.T) {
+	t.Run("Invalid Reference Format", func(t *testing.T) {
+		ep, err := GetRegistryEndpoint(context.Background(), &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		client, err := NewClient(ep, "", "")
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "test@test")
+		require.Error(t, err)
+		assert.Contains(t, "invalid reference format", err.Error())
+
+	})
+	t.Run("Success Ping", func(t *testing.T) {
+		ep, err := GetRegistryEndpoint(context.Background(), &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		client, err := NewClient(ep, "", "")
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "test/test")
+		require.NoError(t, err)
+	})
+
+	t.Run("Fail Ping", func(t *testing.T) {
+		testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		ep := &RegistryEndpoint{RegistryAPI: testServer.URL}
+		client, err := NewClient(ep, "", "")
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "")
+		require.Error(t, err)
+	})
+
+}
+
+// anonymousRootRegistry builds a registry whose /v2/ root answers anonymously
+// with 200 and no challenge, while the tags endpoint for a single repository
+// demands the given auth scheme. It records the Authorization header seen on
+// every tags request, in order.
+func anonymousRootRegistry(t *testing.T, repo, scheme string, authorized func(*http.Request) bool) (*httptest.Server, *[]string) {
+	t.Helper()
+
+	var authHeaders []string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/v2/"+repo+"/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		if !authorized(r) {
+			w.Header().Set("WWW-Authenticate", scheme+` realm="test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"name":%q,"tags":["stg-latest"]}`, repo)
+	})
+
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return server, &authHeaders
+}
+
+// TestNewRepository_AnonymousRootBasicAuthRepo reproduces the scenario reported
+// against a zot registry: the /v2/ root allows anonymous access (200, no
+// WWW-Authenticate challenge), but the tags endpoint for a given repository
+// requires Basic auth. The ping therefore records no challenge, so the
+// credentials have to be learned from the repository's own 401.
+func TestNewRepository_AnonymousRootBasicAuthRepo(t *testing.T) {
+	const repo = "shrestech/printready-web"
+
+	server, authHeaders := anonymousRootRegistry(t, repo, "Basic", func(r *http.Request) bool {
+		user, pass, ok := r.BasicAuth()
+		return ok && user == "testuser" && pass == "testpass"
+	})
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "testuser", "testpass")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), repo))
+
+	tags, err := client.Tags(context.Background())
+	require.NoError(t, err)
+	assert.Contains(t, tags, "stg-latest")
+
+	// First attempt goes out anonymously, the 401 teaches the challenge, the
+	// replay carries the configured credentials.
+	require.Len(t, *authHeaders, 2)
+	assert.Empty(t, (*authHeaders)[0])
+	assert.NotEmpty(t, (*authHeaders)[1])
+}
+
+// TestNewRepository_AnonymousRootPublicRepo guards the scope of the fix: a
+// repository that never challenges must keep being scanned anonymously, even
+// when credentials are configured for the endpoint. Attaching them preemptively
+// would break public repositories on registries where the configured
+// credentials are stale or scoped elsewhere.
+func TestNewRepository_AnonymousRootPublicRepo(t *testing.T) {
+	const repo = "public/app"
+
+	server, authHeaders := anonymousRootRegistry(t, repo, "Basic", func(r *http.Request) bool { return true })
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "testuser", "testpass")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), repo))
+
+	tags, err := client.Tags(context.Background())
+	require.NoError(t, err)
+	assert.Contains(t, tags, "stg-latest")
+
+	require.Len(t, *authHeaders, 1)
+	assert.Empty(t, (*authHeaders)[0], "credentials must not be sent to a repository that never asked for them")
+}
+
+// TestNewRepository_AnonymousRootBearerRepo covers the other half of the same
+// gap: an anonymous /v2/ root in front of repositories protected by a Bearer
+// token service. Learning the challenge from the repository response is
+// scheme-agnostic, so the token handler is selected here without the client
+// needing to guess.
+func TestNewRepository_AnonymousRootBearerRepo(t *testing.T) {
+	const repo = "private/app"
+
+	tokenService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "testuser" || pass != "testpass" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"token":"issued-token"}`)
+	}))
+	defer tokenService.Close()
+
+	var authHeaders []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/v2/"+repo+"/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "Bearer issued-token" {
+			w.Header().Set("WWW-Authenticate",
+				fmt.Sprintf(`Bearer realm=%q,service="test"`, tokenService.URL))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"name":%q,"tags":["stg-latest"]}`, repo)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "testuser", "testpass")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), repo))
+
+	tags, err := client.Tags(context.Background())
+	require.NoError(t, err)
+	assert.Contains(t, tags, "stg-latest")
+
+	require.Len(t, authHeaders, 2)
+	assert.Empty(t, authHeaders[0])
+	assert.Equal(t, "Bearer issued-token", authHeaders[1])
+}
+
+// TestNewRepository_RedirectedBlobIsNotLearnedFrom covers the blob-redirect
+// shape used by large registries: the blob read is redirected to object storage
+// under a path that also contains "/v2/", and that host rejects the request.
+// Credentials for the registry must not be replayed at the redirect target.
+func TestNewRepository_RedirectedBlobIsNotLearnedFrom(t *testing.T) {
+	var storageAuthHeaders []string
+
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageAuthHeaders = append(storageAuthHeaders, r.Header.Get("Authorization"))
+		w.Header().Set("WWW-Authenticate", `Basic realm="storage"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer storage.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/v2/some/app/blobs/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, storage.URL+"/docker/registry/v2/blobs/sha256/deadbeef", http.StatusTemporaryRedirect)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "testuser", "testpass")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), "some/app"))
+
+	_, err = client.(*registryClient).BlobContent(context.Background(),
+		godigest.Digest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+	require.Error(t, err)
+
+	require.Len(t, storageAuthHeaders, 1, "the redirect target must not be retried")
+	assert.Empty(t, storageAuthHeaders[0], "registry credentials must not be sent to the redirect target")
+}
+
+// TestNewRepository_AnonymousRootNoCredentials asserts that a Basic challenge
+// the client cannot answer is left unrecorded. Recording it would make
+// endpointAuthorizer fail the next request with "no basic auth credentials"
+// before it reaches the wire, replacing the registry's own error and hiding the
+// 401 from IsAuthError.
+func TestNewRepository_AnonymousRootNoCredentials(t *testing.T) {
+	const repo = "private/app"
+
+	server, authHeaders := anonymousRootRegistry(t, repo, "Basic", func(r *http.Request) bool { return false })
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "", "")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), repo))
+
+	_, err = client.Tags(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unauthorized")
+	assert.NotContains(t, err.Error(), "no basic auth credentials",
+		"the registry's own 401 must reach the caller, not an authorizer error")
+	assert.Len(t, *authHeaders, 1, "no replay is possible without credentials")
+}
+
+// TestNewRepository_AnonymousRootBadCredentials asserts the replay happens at
+// most once. A registry that rejects the credentials it asked for must not send
+// the client into a retry loop.
+func TestNewRepository_AnonymousRootBadCredentials(t *testing.T) {
+	const repo = "private/app"
+
+	server, authHeaders := anonymousRootRegistry(t, repo, "Basic", func(r *http.Request) bool { return false })
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "testuser", "wrongpass")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), repo))
+
+	_, err = client.Tags(context.Background())
+	require.Error(t, err)
+	assert.Len(t, *authHeaders, 2, "expected exactly one replay after the challenge was learned")
+}
+
+// TestNewRepository_AnonymousRootMixedChallengeNoCredentials covers a 401 that
+// offers Bearer and Basic together while no credentials are configured -- the
+// shape of a public repository on a registry that advertises both schemes.
+// endpointAuthorizer aborts a request on the first handler error, so recording
+// the unanswerable Basic challenge alongside the Bearer one would kill the
+// replay with "no basic auth credentials" even though the token service hands
+// out anonymous pull tokens. Only satisfiable schemes may be recorded.
+func TestNewRepository_AnonymousRootMixedChallengeNoCredentials(t *testing.T) {
+	const repo = "public/app"
+
+	tokenService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"token":"anonymous-token"}`)
+	}))
+	defer tokenService.Close()
+
+	var authHeaders []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/v2/"+repo+"/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "Bearer anonymous-token" {
+			w.Header().Add("WWW-Authenticate",
+				fmt.Sprintf(`Bearer realm=%q,service="test"`, tokenService.URL))
+			w.Header().Add("WWW-Authenticate", `Basic realm="test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"name":%q,"tags":["stg-latest"]}`, repo)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "", "")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), repo))
+
+	tags, err := client.Tags(context.Background())
+	require.NoError(t, err)
+	assert.Contains(t, tags, "stg-latest")
+
+	require.Len(t, authHeaders, 2)
+	assert.Empty(t, authHeaders[0])
+	assert.Equal(t, "Bearer anonymous-token", authHeaders[1])
+}
+
+// TestNewRepository_AnonymousRootMixedChallengeUnauthorized pins the error the
+// caller sees when the same mixed challenge cannot be answered at all. It must
+// stay the registry's own 401 rather than an authorizer-level error raised
+// before the request ever reaches the wire.
+func TestNewRepository_AnonymousRootMixedChallengeUnauthorized(t *testing.T) {
+	const repo = "private/app"
+
+	tokenService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"token":"anonymous-token"}`)
+	}))
+	defer tokenService.Close()
+
+	var authHeaders []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/v2/"+repo+"/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		w.Header().Add("WWW-Authenticate",
+			fmt.Sprintf(`Bearer realm=%q,service="test"`, tokenService.URL))
+		w.Header().Add("WWW-Authenticate", `Basic realm="test"`)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "", "")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), repo))
+
+	_, err = client.Tags(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unauthorized")
+	assert.NotContains(t, err.Error(), "no basic auth credentials",
+		"the registry's own 401 must reach the caller, not an authorizer error")
+	assert.Len(t, authHeaders, 2, "expected exactly one replay after the challenge was learned")
+}
+
+func TestRoundTrip_Success(t *testing.T) {
+	// Create mocks
+	mockLimiter := new(mocks.Limiter)
+	mockTransport := new(mocks.RoundTripper)
+	endpoint := &RegistryEndpoint{RegistryAPI: "http://example.com"}
+	// Create an instance of rateLimitTransport with mocks
+	rlt := &rateLimitTransport{
+		limiter:   mockLimiter,
+		transport: mockTransport,
+		endpoint:  endpoint,
+	}
+	// Create a sample HTTP request
+	req, err := http.NewRequest("GET", "http://example.com", nil)
+	assert.NoError(t, err)
+	resp := &http.Response{StatusCode: http.StatusOK}
+	// Set up expectations
+	mockLimiter.On("Take").Return(time.Now())
+	mockTransport.On("RoundTrip", req).Return(resp, nil)
+	// Call the method under test
+	actualResp, err := rlt.RoundTrip(req)
+	// Assert the expectations
+	mockLimiter.AssertExpectations(t)
+	mockTransport.AssertExpectations(t)
+	assert.NoError(t, err)
+	assert.Equal(t, resp, actualResp)
+}
+func TestRoundTrip_Failure(t *testing.T) {
+	// Create mocks
+	mockLimiter := new(mocks.Limiter)
+	mockTransport := new(mocks.RoundTripper)
+	endpoint := &RegistryEndpoint{RegistryAPI: "http://example.com"}
+	// Create an instance of rateLimitTransport with mocks
+	rlt := &rateLimitTransport{
+		limiter:   mockLimiter,
+		transport: mockTransport,
+		endpoint:  endpoint,
+	}
+	// Create a sample HTTP request
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+	// Set up expectations
+	mockLimiter.On("Take").Return(time.Now())
+	mockTransport.On("RoundTrip", req).Return(nil, errors.New("Error on caling func RoundTrip"))
+	// Call the method under test
+	actualResp, err := rlt.RoundTrip(req)
+	// Assert the expectations
+	mockLimiter.AssertExpectations(t)
+	mockTransport.AssertExpectations(t)
+	assert.Error(t, err)
+	assert.Nil(t, actualResp)
+}
+
+func TestRefreshToken(t *testing.T) {
+	creds := credentials{
+		refreshTokens: map[string]string{
+			"service1": "token1",
+		},
+	}
+	testURL, _ := url.Parse("https://example.com")
+	token := creds.RefreshToken(testURL, "service1")
+	if token != "token1" {
+		t.Errorf("Expected token to be 'token1', got '%s'", token)
+	}
+}
+
+func TestSetRefreshToken(t *testing.T) {
+	creds := credentials{
+		refreshTokens: make(map[string]string),
+	}
+	testURL, _ := url.Parse("https://example.com")
+	creds.SetRefreshToken(testURL, "service1", "token1")
+
+	if token, exists := creds.refreshTokens["service1"]; !exists {
+		t.Error("Expected token for 'service1' to exist")
+	} else if token != "token1" {
+		t.Errorf("Expected token to be 'token1', got '%s'", token)
+	}
+}
+func TestNewClient(t *testing.T) {
+	t.Run("Create client with provided username and password", func(t *testing.T) {
+		ep, err := GetRegistryEndpoint(context.Background(), &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		_, err = NewClient(ep, "testuser", "pass")
+		require.NoError(t, err)
+	})
+	t.Run("Create client with empty username and password", func(t *testing.T) {
+		ep := &RegistryEndpoint{Username: "testuser", Password: "pass"}
+		_, err := NewClient(ep, "", "")
+		require.NoError(t, err)
+	})
+}
+
+func TestTags(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		mockTagService := new(mocks.TagService)
+		mockTagService.On("All", mock.Anything).Return([]string{"testTag-1", "testTag-2"}, nil)
+		mockRegClient.On("Tags", mock.Anything).Return(mockTagService)
+		tags, err := client.Tags(context.Background())
+		require.NoError(t, err)
+		assert.Contains(t, tags, "testTag-1")
+		assert.Contains(t, tags, "testTag-2")
+	})
+	t.Run("Fail", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		mockTagService := new(mocks.TagService)
+		mockTagService.On("All", mock.Anything).Return([]string{}, errors.New("Error on caling func All"))
+		mockRegClient.On("Tags", mock.Anything).Return(mockTagService)
+		_, err := client.Tags(context.Background())
+		require.Error(t, err)
+	})
+}
+
+func TestManifestForTag(t *testing.T) {
+	t.Run("Successful retrieval of Manifest", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		manService := new(mocks.ManifestService)
+		manService.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
+		mockRegClient.On("Manifests", mock.Anything).Return(manService, nil)
+		_, err := client.ManifestForTag(context.Background(), "tagStr")
+		require.NoError(t, err)
+	})
+	t.Run("Error returned from Manifests call", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		manService := new(mocks.ManifestService)
+		manService.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
+		mockRegClient.On("Manifests", mock.Anything).Return(manService, errors.New("Error on caling func Manifests"))
+		_, err := client.ManifestForTag(context.Background(), "tagStr")
+		require.Error(t, err)
+	})
+
+	t.Run("Error returned from Get call", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		manService := new(mocks.ManifestService)
+		manService.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("Error on caling func Get"))
+		mockRegClient.On("Manifests", mock.Anything).Return(manService, nil)
+		_, err := client.ManifestForTag(context.Background(), "tagStr")
+		require.Error(t, err)
+	})
+
+}
+
+func TestManifestForDigest(t *testing.T) {
+	t.Run("Successful retrieval of manifest", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		manService := new(mocks.ManifestService)
+		manService.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
+		mockRegClient.On("Manifests", mock.Anything).Return(manService, nil)
+		_, err := client.ManifestForDigest(context.Background(), "dgst")
+		require.NoError(t, err)
+	})
+	t.Run("Error returned from Manifests call", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		manService := new(mocks.ManifestService)
+		manService.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
+		mockRegClient.On("Manifests", mock.Anything).Return(manService, errors.New("Error on caling func Manifests"))
+		_, err := client.ManifestForDigest(context.Background(), "dgst")
+		require.Error(t, err)
+	})
+	t.Run("Error returned from Get call", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		manService := new(mocks.ManifestService)
+		manService.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("Error on caling func Get"))
+		mockRegClient.On("Manifests", mock.Anything).Return(manService, nil)
+		_, err := client.ManifestForDigest(context.Background(), "dgst")
+		require.Error(t, err)
+	})
+}
+
+func TestTagInfoFromReferences(t *testing.T) {
+	t.Run("No usable reference in manifest list", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		tagInfo := &tag.TagInfo{}
+		tagInfo.CreatedAt = time.Now()
+		tagInfo.Digest = [32]byte{}
+		opts := &options.ManifestOptions{}
+		opts.WithPlatform("testOS", "testArch", "testVarient")
+		//opts.WithLogger(log.NewContext())
+		opts.WithMetadata(true)
+		descriptor := []distribution.Descriptor{
+			{
+				MediaType: "",
+				Digest:    "",
+				Size:      0,
+				Platform: &v1.Platform{
+					Architecture: "mTestArch",
+					OS:           "mTestOS",
+					OSVersion:    "mTestOSVersion",
+					OSFeatures:   []string{},
+					Variant:      "mTestVarient",
+				},
+			},
+		}
+		tag, err := TagInfoFromReferences(context.Background(), &client, opts, tagInfo, descriptor)
+		require.Nil(t, tag)
+		require.NoError(t, err)
+	})
+	t.Run("Return tagInfo when metadata option is false", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		tagInfo := &tag.TagInfo{}
+		tagInfo.CreatedAt = time.Now()
+		tagInfo.Digest = [32]byte{}
+		opts := &options.ManifestOptions{}
+		opts.WithMetadata(false)
+		opts.WithPlatform("testOS", "testArch", "testVarient")
+		//opts.WithLogger(log.NewContext())
+		descriptor := []distribution.Descriptor{
+			{
+				MediaType: "",
+				Digest:    "",
+				Size:      0,
+				Platform: &v1.Platform{
+					Architecture: "testArch",
+					OS:           "testOS",
+					OSVersion:    "testOSVersion",
+					OSFeatures:   []string{},
+					Variant:      "testVarient",
+				},
+			},
+		}
+		tag, err := TagInfoFromReferences(context.Background(), &client, opts, tagInfo, descriptor)
+		require.NoError(t, err)
+		assert.Equal(t, tag, tagInfo)
+		require.NoError(t, err)
+	})
+	t.Run("Return error from ManifestForDigest", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		tagInfo := &tag.TagInfo{}
+		tagInfo.CreatedAt = time.Now()
+		tagInfo.Digest = [32]byte{}
+		opts := &options.ManifestOptions{}
+		opts.WithMetadata(true)
+		opts.WithPlatform("testOS", "testArch", "testVarient")
+		//opts.WithLogger(log.NewContext())
+		descriptor := []distribution.Descriptor{
+			{
+				MediaType: "",
+				Digest:    "",
+				Size:      0,
+				Platform: &v1.Platform{
+					Architecture: "testArch",
+					OS:           "testOS",
+					OSVersion:    "testOSVersion",
+					OSFeatures:   []string{},
+					Variant:      "testVarient",
+				},
+			},
+		}
+		mockRegClient.On("Manifests", mock.Anything).Return(nil, errors.New("Error from Manifests"))
+		_, err := TagInfoFromReferences(context.Background(), &client, opts, tagInfo, descriptor)
+		require.Error(t, err)
+	})
+	t.Run("Return error from TagMetadata", func(t *testing.T) {
+		mockRegClient := new(mocks.Repository)
+		client := registryClient{
+			regClient: mockRegClient,
+		}
+		tagInfo := &tag.TagInfo{}
+		tagInfo.CreatedAt = time.Now()
+		tagInfo.Digest = [32]byte{}
+		opts := &options.ManifestOptions{}
+		opts.WithMetadata(true)
+		opts.WithPlatform("testOS", "testArch", "testVarient")
+		//opts.WithLogger(log.NewContext())
+		descriptor := []distribution.Descriptor{
+			{
+				MediaType: "",
+				Digest:    "",
+				Size:      0,
+				Platform: &v1.Platform{
+					Architecture: "testArch",
+					OS:           "testOS",
+					OSVersion:    "testOSVersion",
+					OSFeatures:   []string{},
+					Variant:      "testVarient",
+				},
+			},
+		}
+		manService := new(mocks.ManifestService)
+		manService.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(new(mocks.Manifest), nil)
+		mockRegClient.On("Manifests", mock.Anything).Return(manService, nil)
+		_, err := TagInfoFromReferences(context.Background(), &client, opts, tagInfo, descriptor)
+		require.Error(t, err)
+	})
+}
+
+func Test_TagMetadata(t *testing.T) {
+	// makeConfigServer creates a local test registry that serves configJSON as
+	// the config blob at /v2/test/test/blobs/*. Pass an empty string to
+	// simulate a missing blob (404).
+	makeConfigServer := func(t *testing.T, configJSON string) (*httptest.Server, godigest.Digest) {
+		t.Helper()
+		var configDigest godigest.Digest
+		if configJSON == "" {
+			configDigest = godigest.FromBytes([]byte("placeholder"))
+		} else {
+			configDigest = godigest.FromBytes([]byte(configJSON))
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		mux.HandleFunc("/v2/test/test/blobs/", func(w http.ResponseWriter, r *http.Request) {
+			if configJSON == "" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, configJSON)
+		})
+		return httptest.NewServer(mux), configDigest
+	}
+
+	makeClient := func(t *testing.T, serverURL string) RegistryClient {
+		t.Helper()
+		ep := &RegistryEndpoint{RegistryAPI: serverURL, Limiter: ratelimit.New(100)}
+		client, err := NewClient(ep, "", "")
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "test/test")
+		require.NoError(t, err)
+		return client
+	}
+
+	makeManifest := func(configDigest godigest.Digest) *schema2.DeserializedManifest {
+		return &schema2.DeserializedManifest{
+			Manifest: schema2.Manifest{
+				Versioned: specs.Versioned{SchemaVersion: 2},
+				Config: distribution.Descriptor{
+					Digest: configDigest,
+				},
+			},
+		}
+	}
+
+	t.Run("Check for correct error handling when config blob is missing", func(t *testing.T) {
+		server, configDigest := makeConfigServer(t, "")
+		defer server.Close()
+		ctx := context.Background()
+		client := makeClient(t, server.URL)
+		_, err := client.TagMetadata(ctx, makeManifest(configDigest), &options.ManifestOptions{})
+		require.Error(t, err)
+	})
+
+	t.Run("Check for correct error handling when config blob contains invalid JSON", func(t *testing.T) {
+		server, configDigest := makeConfigServer(t, `{not valid json}`)
+		defer server.Close()
+		ctx := context.Background()
+		client := makeClient(t, server.URL)
+		_, err := client.TagMetadata(ctx, makeManifest(configDigest), &options.ManifestOptions{})
+		require.Error(t, err)
+	})
+
+	t.Run("Check for correct error handling when config blob contains no created field", func(t *testing.T) {
+		server, configDigest := makeConfigServer(t, `{"something": "something"}`)
+		defer server.Close()
+		ctx := context.Background()
+		client := makeClient(t, server.URL)
+		_, err := client.TagMetadata(ctx, makeManifest(configDigest), &options.ManifestOptions{})
+		require.Error(t, err)
+	})
+
+	t.Run("Check for invalid/valid timestamp and non-match platforms", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Invalid timestamp → error
+		server, configDigest := makeConfigServer(t, `{"created":"invalid"}`)
+		defer server.Close()
+		client := makeClient(t, server.URL)
+		_, err := client.TagMetadata(ctx, makeManifest(configDigest), &options.ManifestOptions{})
+		require.Error(t, err)
+
+		// Valid timestamp → success
+		ts := time.Now().Format(time.RFC3339Nano)
+		server2, configDigest2 := makeConfigServer(t, `{"created":"`+ts+`"}`)
+		defer server2.Close()
+		client2 := makeClient(t, server2.URL)
+		opts := &options.ManifestOptions{}
+		tagInfo, _ := client2.TagMetadata(ctx, makeManifest(configDigest2), opts)
+		assert.Equal(t, ts, tagInfo.CreatedAt.Format(time.RFC3339Nano))
+
+		// Platform mismatch (config has no os/arch, opts requires testOS/testArch) → nil, nil
+		opts.WithPlatform("testOS", "testArch", "testVariant")
+		tagInfo, err = client2.TagMetadata(ctx, makeManifest(configDigest2), opts)
+		assert.Nil(t, tagInfo)
+		assert.Nil(t, err)
+	})
+
+	t.Run("Check manifest labels are extracted", func(t *testing.T) {
+		ts := time.Now().Format(time.RFC3339Nano)
+		configJSON := `{"created":"` + ts + `","config":{"Labels":{"org.opencontainers.image.source":"https://github.com/org/repo","org.opencontainers.image.revision":"abc123"}}}`
+		server, configDigest := makeConfigServer(t, configJSON)
+		defer server.Close()
+		ctx := context.Background()
+		client := makeClient(t, server.URL)
+		tagInfo, err := client.TagMetadata(ctx, makeManifest(configDigest), &options.ManifestOptions{})
+		require.NoError(t, err)
+		require.NotNil(t, tagInfo)
+		assert.Equal(t, "https://github.com/org/repo", tagInfo.Labels["org.opencontainers.image.source"])
+		assert.Equal(t, "abc123", tagInfo.Labels["org.opencontainers.image.revision"])
+	})
+
+	t.Run("Check manifest without labels", func(t *testing.T) {
+		ts := time.Now().Format(time.RFC3339Nano)
+		server, configDigest := makeConfigServer(t, `{"created":"`+ts+`"}`)
+		defer server.Close()
+		ctx := context.Background()
+		client := makeClient(t, server.URL)
+		tagInfo, err := client.TagMetadata(ctx, makeManifest(configDigest), &options.ManifestOptions{})
+		require.NoError(t, err)
+		require.NotNil(t, tagInfo)
+		assert.Nil(t, tagInfo.Labels)
+	})
+}
+
+func Test_TagMetadata_2(t *testing.T) {
+	t.Run("ocischema DeserializedManifest invalid digest format", func(t *testing.T) {
+		meta1 := &ocischema.DeserializedManifest{
+			Manifest: ocischema.Manifest{
+				Versioned: specs.Versioned{
+					SchemaVersion: 1,
+				},
+				MediaType: "",
+			},
+		}
+		ctx := context.Background()
+		ep, err := GetRegistryEndpoint(ctx, &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		client, err := NewClient(ep, "", "")
+
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "test/test")
+		require.NoError(t, err)
+		_, err = client.TagMetadata(ctx, meta1, &options.ManifestOptions{})
+		require.Error(t, err) // invalid digest format
+	})
+	t.Run("schema2 DeserializedManifest invalid digest format", func(t *testing.T) {
+		meta1 := &schema2.DeserializedManifest{
+			Manifest: schema2.Manifest{
+				Versioned: specs.Versioned{
+					SchemaVersion: 1,
+				},
+				MediaType: "",
+				Config: distribution.Descriptor{
+					MediaType: "",
+					Digest:    "sha256:abc",
+				},
+			},
+		}
+		ctx := context.Background()
+		ep, err := GetRegistryEndpoint(ctx, &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		client, err := NewClient(ep, "", "")
+
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "test/test")
+		require.NoError(t, err)
+		_, err = client.TagMetadata(ctx, meta1, &options.ManifestOptions{})
+		require.Error(t, err) // invalid digest format
+	})
+	t.Run("ocischema DeserializedImageIndex empty index not supported", func(t *testing.T) {
+		meta1 := &ocischema.DeserializedImageIndex{
+			ImageIndex: ocischema.ImageIndex{
+				Versioned: specs.Versioned{
+					SchemaVersion: 1,
+				},
+				MediaType:   "",
+				Manifests:   nil,
+				Annotations: nil,
+			},
+		}
+		ctx := context.Background()
+		ep, err := GetRegistryEndpoint(ctx, &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		client, err := NewClient(ep, "", "")
+
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "test/test")
+		require.NoError(t, err)
+		_, err = client.TagMetadata(ctx, meta1, &options.ManifestOptions{})
+		require.Error(t, err) // empty index not supported
+	})
+	t.Run("ocischema DeserializedImageIndex empty manifestlist not supported", func(t *testing.T) {
+		meta1 := &manifestlist.DeserializedManifestList{
+			ManifestList: manifestlist.ManifestList{
+				Versioned: specs.Versioned{
+					SchemaVersion: 1,
+				},
+				MediaType: "",
+				Manifests: nil,
+			},
+		}
+		ctx := context.Background()
+		ep, err := GetRegistryEndpoint(ctx, &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		client, err := NewClient(ep, "", "")
+
+		require.NoError(t, err)
+		err = client.NewRepository(context.Background(), "test/test")
+		require.NoError(t, err)
+		_, err = client.TagMetadata(ctx, meta1, &options.ManifestOptions{})
+		require.Error(t, err) // empty manifestlist not supported
+	})
+}
+
+func TestPing(t *testing.T) {
+	t.Run("fail ping", func(t *testing.T) {
+		mockManager := new(mocks.Manager)
+		ep, err := GetRegistryEndpoint(context.Background(), &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		mockManager.On("AddResponse", mock.Anything).Return(fmt.Errorf("fail ping"))
+		_, err = ping(context.Background(), mockManager, ep, "")
+		require.Error(t, err)
+	})
+
+	t.Run("success ping", func(t *testing.T) {
+		mockManager := new(mocks.Manager)
+		ep, err := GetRegistryEndpoint(context.Background(), &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		mockManager.On("AddResponse", mock.Anything).Return(nil)
+		_, err = ping(context.Background(), mockManager, ep, "")
+		require.NoError(t, err)
+	})
+
+	t.Run("Invalid Docker Registry", func(t *testing.T) {
+		testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		mockManager := new(mocks.Manager)
+		ep := &RegistryEndpoint{RegistryAPI: testServer.URL}
+		mockManager.On("AddResponse", mock.Anything).Return(nil)
+		_, err := ping(context.Background(), mockManager, ep, "")
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "does not seem to be a valid v2 Docker Registry API")
+	})
+
+	t.Run("Empty Registry API", func(t *testing.T) {
+		mockManager := new(mocks.Manager)
+		ep := &RegistryEndpoint{RegistryAPI: ""}
+		mockManager.On("AddResponse", mock.Anything).Return(nil)
+		_, err := ping(context.Background(), mockManager, ep, "")
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "unsupported protocol scheme")
+	})
+
+	// A registry that answers the ping anonymously must not have a challenge
+	// invented for it. Credentials are only ever attached in response to a
+	// challenge the registry actually sent; see challengeRetryTransport.
+	t.Run("anonymous root registers no challenge", func(t *testing.T) {
+		testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer testServer.Close()
+		manager := challenge.NewSimpleManager()
+		ep := &RegistryEndpoint{RegistryAPI: testServer.URL}
+		_, err := ping(context.Background(), manager, ep, "")
+		require.NoError(t, err)
+
+		u, err := url.Parse(testServer.URL + "/v2/")
+		require.NoError(t, err)
+		challenges, err := manager.GetChallenges(*u)
+		require.NoError(t, err)
+		assert.Empty(t, challenges)
+	})
+}
+
+func TestIsAuthError(t *testing.T) {
+	ctx := context.Background()
+	t.Run("nil returns false", func(t *testing.T) {
+		assert.False(t, IsAuthError(ctx, nil))
+	})
+
+	t.Run("plain error returns false", func(t *testing.T) {
+		assert.False(t, IsAuthError(ctx, errors.New("some error")))
+	})
+
+	t.Run("UnexpectedHTTPResponseError 401 returns true", func(t *testing.T) {
+		err := &distclient.UnexpectedHTTPResponseError{StatusCode: http.StatusUnauthorized}
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("UnexpectedHTTPResponseError 403 returns true", func(t *testing.T) {
+		err := &distclient.UnexpectedHTTPResponseError{StatusCode: http.StatusForbidden}
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("UnexpectedHTTPResponseError 404 returns false", func(t *testing.T) {
+		err := &distclient.UnexpectedHTTPResponseError{StatusCode: http.StatusNotFound}
+		assert.False(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("UnexpectedHTTPStatusError 401 returns true", func(t *testing.T) {
+		err := &distclient.UnexpectedHTTPStatusError{Status: "401 Unauthorized"}
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("UnexpectedHTTPStatusError 403 returns true", func(t *testing.T) {
+		err := &distclient.UnexpectedHTTPStatusError{Status: "403 Forbidden"}
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("UnexpectedHTTPStatusError 500 returns false", func(t *testing.T) {
+		err := &distclient.UnexpectedHTTPStatusError{Status: "500 Internal Server Error"}
+		assert.False(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("errcode.Errors with Unauthorized returns true", func(t *testing.T) {
+		err := errcode.Errors{errcode.ErrorCodeUnauthorized.WithMessage("authentication required")}
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("errcode.Errors with Denied returns true", func(t *testing.T) {
+		err := errcode.Errors{errcode.ErrorCodeDenied.WithMessage("access denied")}
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("bare errcode.Errors with Unauthorized returns true", func(t *testing.T) {
+		// Test that bare errcode.ErrorCodeUnauthorized values are recognized as auth errors
+		assert.True(t, IsAuthError(ctx, errcode.Errors{errcode.ErrorCodeUnauthorized}))
+	})
+
+	t.Run("bare errcode.Errors with Denied returns true", func(t *testing.T) {
+		// Test that bare errcode.ErrorCodeDenied values are recognized as auth errors
+		assert.True(t, IsAuthError(ctx, errcode.Errors{errcode.ErrorCodeDenied}))
+	})
+
+	t.Run("JSON with canonical message decodes to bare code and returns true", func(t *testing.T) {
+		// An element whose message equals the code's canonical message and that
+		// carries no detail is decoded to a bare errcode.ErrorCode, not errcode.Error
+		var err errcode.Errors
+		require.NoError(t, json.Unmarshal([]byte(`{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`), &err))
+		require.IsType(t, errcode.ErrorCode(0), err[0])
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("JSON with custom message decodes to errcode.Error and returns true", func(t *testing.T) {
+		// A message that differs from the canonical one is preserved, so the
+		// element stays a structured errcode.Error
+		var err errcode.Errors
+		require.NoError(t, json.Unmarshal([]byte(`{"errors":[{"code":"UNAUTHORIZED","message":"you shall not pass"}]}`), &err))
+		require.IsType(t, errcode.Error{}, err[0])
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("JSON without message returns true", func(t *testing.T) {
+		// Test that registry error objects without a message field are recognized
+		// as auth errors; they decode to bare errcode.ErrorCode values
+		var err errcode.Errors
+		require.NoError(t, json.Unmarshal([]byte(`{"errors":[{"code":"UNAUTHORIZED"}]}`), &err))
+		assert.True(t, IsAuthError(ctx, err))
+	})
+
+	t.Run("errcode.Errors with other code returns false", func(t *testing.T) {
+		err := errcode.Errors{errcode.ErrorCodeUnknown.WithMessage("something else")}
+		assert.False(t, IsAuthError(ctx, err))
+	})
+
+	// The distribution client returns a single, unwrapped errcode value - not an
+	// errcode.Errors slice - whenever a 4xx response has an empty body, no
+	// Content-Type, a non-JSON Content-Type, or a body it cannot unmarshal.
+
+	t.Run("unwrapped errcode.Error with Unauthorized returns true", func(t *testing.T) {
+		assert.True(t, IsAuthError(ctx, errcode.ErrorCodeUnauthorized.WithMessage("")))
+	})
+
+	t.Run("unwrapped errcode.Error with Denied returns true", func(t *testing.T) {
+		assert.True(t, IsAuthError(ctx, errcode.ErrorCodeDenied.WithMessage("access to the requested resource is not authorized")))
+	})
+
+	t.Run("unwrapped errcode.Error with detail returns true", func(t *testing.T) {
+		assert.True(t, IsAuthError(ctx, errcode.ErrorCodeUnauthorized.WithDetail([]byte("<html>401 Authorization Required</html>"))))
+	})
+
+	t.Run("unwrapped errcode.ErrorCode with Unauthorized returns true", func(t *testing.T) {
+		assert.True(t, IsAuthError(ctx, errcode.ErrorCodeUnauthorized))
+	})
+
+	t.Run("unwrapped errcode.ErrorCode with Denied returns true", func(t *testing.T) {
+		assert.True(t, IsAuthError(ctx, errcode.ErrorCodeDenied))
+	})
+
+	t.Run("unwrapped errcode with other code returns false", func(t *testing.T) {
+		assert.False(t, IsAuthError(ctx, errcode.ErrorCodeUnknown.WithMessage("boom")))
+		assert.False(t, IsAuthError(ctx, errcode.ErrorCodeTooManyRequests))
+	})
+
+	t.Run("wrapped unwrapped errcode.Error returns true", func(t *testing.T) {
+		err := fmt.Errorf("listing tags: %w", errcode.ErrorCodeUnauthorized.WithMessage(""))
+		assert.True(t, IsAuthError(ctx, err))
+	})
+}
+
+// TestIsAuthErrorFromHTTPResponse covers the end-to-end paths through the
+// distribution client's response parsing that yield a single unwrapped errcode
+// rather than an errcode.Errors slice.
+func TestIsAuthErrorFromHTTPResponse(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name        string
+		statusCode  int
+		contentType string
+		body        string
+		expect      bool
+	}{
+		{name: "401 with empty body", statusCode: http.StatusUnauthorized, contentType: "application/json", expect: true},
+		{name: "401 with no content-type", statusCode: http.StatusUnauthorized, body: "unauthorized", expect: true},
+		{name: "401 with html body", statusCode: http.StatusUnauthorized, contentType: "text/html", body: "<html>401 Authorization Required</html>", expect: true},
+		{name: "401 with unparseable json body", statusCode: http.StatusUnauthorized, contentType: "application/json", body: `{"message":"denied"}`, expect: true},
+		{name: "403 with html body", statusCode: http.StatusForbidden, contentType: "text/html", body: "<html>403 Forbidden</html>", expect: true},
+		{name: "401 with json errors body", statusCode: http.StatusUnauthorized, contentType: "application/json", body: `{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`, expect: true},
+		{name: "404 with html body", statusCode: http.StatusNotFound, contentType: "text/html", body: "<html>404 Not Found</html>", expect: false},
+		{name: "429 with empty body", statusCode: http.StatusTooManyRequests, contentType: "application/json", expect: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: tt.statusCode,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(tt.body)),
+			}
+			if tt.contentType != "" {
+				resp.Header.Set("Content-Type", tt.contentType)
+			}
+			err := distclient.HandleHTTPResponseError(resp)
+			require.Error(t, err)
+			assert.Equal(t, tt.expect, IsAuthError(ctx, err))
+		})
+	}
+}
+
+// makeRegistryClient is a shared helper that creates a real RegistryClient backed
+// by a test HTTP server. The server must respond to GET /v2/ with 200 (for the
+// NewRepository ping) plus whatever path the individual test needs.
+func makeRegistryClient(t *testing.T, serverURL string) RegistryClient {
+	t.Helper()
+	ep := &RegistryEndpoint{RegistryAPI: serverURL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "", "")
+	require.NoError(t, err)
+	err = client.NewRepository(context.Background(), "test/test")
+	require.NoError(t, err)
+	return client
+}
+
+func Test_BlobContent(t *testing.T) {
+	t.Run("not initialized returns error", func(t *testing.T) {
+		ep, err := GetRegistryEndpoint(context.Background(), &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		client, err := NewClient(ep, "", "")
+		require.NoError(t, err)
+		// NewRepository NOT called → clt.regClient is nil
+		_, err = client.BlobContent(context.Background(), godigest.FromBytes([]byte("x")))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not initialized")
+	})
+
+	t.Run("returns blob bytes on success", func(t *testing.T) {
+		blobContent := []byte("hello-blob")
+		blobDigest := godigest.FromBytes(blobContent)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			// All other /v2/... requests are blob fetches.
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(blobContent)
+		}))
+		defer srv.Close()
+
+		client := makeRegistryClient(t, srv.URL)
+		got, err := client.BlobContent(context.Background(), blobDigest)
+		require.NoError(t, err)
+		assert.Equal(t, blobContent, got)
+	})
+
+	t.Run("blob not found returns error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		client := makeRegistryClient(t, srv.URL)
+		_, err := client.BlobContent(context.Background(), godigest.FromBytes([]byte("missing")))
+		require.Error(t, err)
+	})
+}
+
+func Test_Referrers(t *testing.T) {
+	testDigest := godigest.FromBytes([]byte("image-manifest"))
+
+	t.Run("not initialized returns error", func(t *testing.T) {
+		ep, err := GetRegistryEndpoint(context.Background(), &image.ContainerImage{RegistryURL: ""})
+		require.NoError(t, err)
+		client, err := NewClient(ep, "", "")
+		require.NoError(t, err)
+		// NewRepository NOT called → clt.httpClient is nil
+		_, err = client.Referrers(context.Background(), testDigest)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not initialized")
+	})
+
+	t.Run("http 404 returns nil nil (no signature found, not an error)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		client := makeRegistryClient(t, srv.URL)
+		refs, err := client.Referrers(context.Background(), testDigest)
+		require.NoError(t, err)
+		assert.Nil(t, refs)
+	})
+
+	t.Run("http ok returns manifest list", func(t *testing.T) {
+		sigDigest := godigest.FromBytes([]byte("sig-manifest"))
+		referrersJSON := fmt.Sprintf(
+			`{"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json","digest":"%s","size":100}]}`,
+			sigDigest,
+		)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, referrersJSON)
+		}))
+		defer srv.Close()
+
+		client := makeRegistryClient(t, srv.URL)
+		refs, err := client.Referrers(context.Background(), testDigest)
+		require.NoError(t, err)
+		require.Len(t, refs, 1)
+		assert.Equal(t, "application/vnd.dev.sigstore.bundle.v0.3+json", refs[0].ArtifactType)
+		assert.Equal(t, sigDigest, refs[0].Digest)
+	})
+
+	t.Run("non-200 non-404 returns error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		client := makeRegistryClient(t, srv.URL)
+		refs, err := client.Referrers(context.Background(), testDigest)
+		require.Error(t, err)
+		assert.Nil(t, refs)
+		assert.Contains(t, err.Error(), "HTTP 500")
+	})
+
+	t.Run("invalid json returns error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "not-valid-json{{")
+		}))
+		defer srv.Close()
+
+		client := makeRegistryClient(t, srv.URL)
+		refs, err := client.Referrers(context.Background(), testDigest)
+		require.Error(t, err)
+		assert.Nil(t, refs)
+		assert.Contains(t, err.Error(), "decoding")
+	})
+}
+
+func TestRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{"missing", "", tooManyRequestsDefaultWait},
+		{"unparsable", "soon", tooManyRequestsDefaultWait},
+		{"zero seconds", "0", 0},
+		{"seconds", "5", 5 * time.Second},
+		{"negative seconds", "-3", 0},
+		{"seconds above the cap", "120", tooManyRequestsMaxWait},
+		{"http date", now.Add(10 * time.Second).Format(http.TimeFormat), 10 * time.Second},
+		{"http date in the past", now.Add(-time.Minute).Format(http.TimeFormat), 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, retryAfter(tt.value, now))
+		})
+	}
+}
+
+func TestTooManyRequestsRetryTransport(t *testing.T) {
+	// throttling answers the first `throttled` requests with 429 and the rest with 200.
+	throttling := func(throttled int32, retryAfter string) (*httptest.Server, *atomic.Int32) {
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if requests.Add(1) <= throttled {
+				w.Header().Set("Retry-After", retryAfter)
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(server.Close)
+		return server, &requests
+	}
+	rt := &tooManyRequestsRetryTransport{base: http.DefaultTransport}
+
+	t.Run("retries a throttled GET until it succeeds", func(t *testing.T) {
+		server, requests := throttling(2, "0")
+		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		resp, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, int32(3), requests.Load())
+	})
+
+	t.Run("returns the 429 once the retries are used up", func(t *testing.T) {
+		server, requests := throttling(100, "0")
+		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		resp, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		assert.Equal(t, int32(1+tooManyRequestsMaxRetries), requests.Load())
+	})
+
+	t.Run("does not retry other methods", func(t *testing.T) {
+		server, requests := throttling(1, "0")
+		req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+		require.NoError(t, err)
+		resp, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		assert.Equal(t, int32(1), requests.Load())
+	})
+
+	t.Run("does not retry a request with a body", func(t *testing.T) {
+		server, requests := throttling(1, "0")
+		req, err := http.NewRequest(http.MethodGet, server.URL, strings.NewReader("body"))
+		require.NoError(t, err)
+		resp, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		assert.Equal(t, int32(1), requests.Load())
+	})
+
+	t.Run("stops waiting when the context is done", func(t *testing.T) {
+		server, requests := throttling(1, "30")
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		start := time.Now()
+		_, err = rt.RoundTrip(req)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Less(t, time.Since(start), 5*time.Second)
+		assert.Equal(t, int32(1), requests.Load())
+	})
+}
+
+// TestTags_RetriesThrottledPage covers a paginated tag list where the registry
+// throttles one page: the page is retried and the full list comes back.
+func TestTags_RetriesThrottledPage(t *testing.T) {
+	const repo = "org/app"
+	var page2Requests atomic.Int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/v2/"+repo+"/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("last") == "" {
+			w.Header().Set("Link", fmt.Sprintf(`</v2/%s/tags/list?n=2&last=b>; rel="next"`, repo))
+			fmt.Fprintf(w, `{"name":%q,"tags":["a","b"]}`, repo)
+			return
+		}
+		if page2Requests.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"errors":[{"code":"TOOMANYREQUESTS","message":"retry-after: 963.091µs, allowed: 44000/minute"}]}`)
+			return
+		}
+		fmt.Fprintf(w, `{"name":%q,"tags":["c"]}`, repo)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	ep := &RegistryEndpoint{RegistryAPI: server.URL, Limiter: ratelimit.New(100)}
+	client, err := NewClient(ep, "", "")
+	require.NoError(t, err)
+	require.NoError(t, client.NewRepository(context.Background(), repo))
+
+	tags, err := client.Tags(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, tags)
+	assert.Equal(t, int32(2), page2Requests.Load())
+}

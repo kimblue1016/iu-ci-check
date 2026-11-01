@@ -1,0 +1,242 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"runtime"
+
+	"github.com/argoproj-labs/argocd-image-updater/pkg/argocd"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/common"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/kube"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/image"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/log"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/options"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/tag"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"go.uber.org/ratelimit"
+)
+
+// resolveCalVerLayout returns the calver layout the test command should run
+// with, along with the layout written in the image tag, if any.
+//
+// The controller takes the layout from the tag position of the image name, so
+// this command has to do the same by default, or copying a line out of the
+// image list would test something other than what the controller runs. The
+// --calver-layout flag overrides it, and an empty result selects the default
+// layout further down.
+func resolveCalVerLayout(flagLayout string, img *image.ContainerImage) (layout, imageTagLayout string) {
+	if img != nil && img.ImageTag != nil {
+		imageTagLayout = img.ImageTag.TagName
+	}
+	if flagLayout != "" {
+		return flagLayout, imageTagLayout
+	}
+	return imageTagLayout, imageTagLayout
+}
+
+func newTestCommand() *cobra.Command {
+	var (
+		semverConstraint   string
+		calverLayout       string
+		strategy           string
+		registriesConfPath string
+		logLevel           string
+		allowTags          string
+		credentials        string
+		kubeConfig         string
+		ignoreTags         []string
+		rateLimit          int
+		platforms          []string
+	)
+	var runCmd = &cobra.Command{
+		Use:   "test IMAGE",
+		Short: "Test the behaviour of argocd-image-updater",
+		Long: `
+The test command lets you test the behaviour of argocd-image-updater before
+configuring ImageUpdater CRD on your Argo CD Applications.
+
+Its main use case is to tell you to which tag a given image would be updated
+to using the given parametrization. Command line switches can be used as a
+way to supply the required parameters.
+`,
+		Example: `
+# In the most simple form, check for the latest available (semver) version of
+# an image in the registry
+argocd-image-updater test nginx
+
+# Check to which version the nginx image within the 1.17 branch would be
+# updated to, using the default semver strategy
+argocd-image-updater test nginx --semver-constraint v1.17.x
+
+# Check for the latest built image for a tag that matches a pattern
+argocd-image-updater test nginx --allow-tags '^1.19.\d+(\-.*)*$' --update-strategy latest
+`,
+		Run: func(cmd *cobra.Command, args []string) {
+			// Create a root context and logger for the command
+			ctx := context.Background()
+			logger := log.LoggerFromContext(ctx).WithField("command", "test")
+			ctx = log.ContextWithLogger(ctx, logger)
+
+			if len(args) != 1 {
+				cmd.HelpFunc()(cmd, args)
+				logger.Fatalf("image needs to be specified")
+			}
+
+			if err := log.SetLogLevel(logLevel); err != nil {
+				logger.Fatalf("could not set log level to %s: %v", logLevel, err)
+			}
+
+			var kubeClient *kube.ImageUpdaterKubernetesClient
+			var err error
+
+			kubeClient, err = argocd.GetKubeConfig(ctx, "", kubeConfig)
+			if err != nil {
+				logger.Fatalf("could not create K8s client: %v", err)
+			}
+
+			img := image.NewFromIdentifier(args[0])
+
+			fields := img.GetLogFields(img.ImageAlias)
+			imgLogger := logger.WithFields(fields)
+			imgCtx := log.ContextWithLogger(ctx, imgLogger)
+
+			vc := &image.VersionConstraint{
+				Constraint: semverConstraint,
+				Strategy:   image.StrategySemVer,
+			}
+
+			vc.Strategy = img.ParseUpdateStrategy(imgCtx, strategy)
+
+			// The calver strategy reads its layout from the constraint, so a
+			// semver constraint must not leak into it.
+			if vc.Strategy == image.StrategyCalVer {
+				layout, imageTagLayout := resolveCalVerLayout(calverLayout, img)
+				switch {
+				case calverLayout == "" && imageTagLayout != "":
+					imgLogger.Infof("Using the image tag as the calver layout: %s", layout)
+				case calverLayout != "" && imageTagLayout != "" && imageTagLayout != calverLayout:
+					imgLogger.Warnf("--calver-layout %s overrides the layout %s written in the image tag", calverLayout, imageTagLayout)
+				}
+				vc.Constraint = layout
+				if _, err := tag.NewCalVerLayout(layout); err != nil {
+					imgLogger.Fatalf("Could not parse calver layout: %v", err)
+				}
+			}
+
+			if allowTags != "" {
+				vc.MatchFunc, vc.MatchArgs = img.ParseMatch(imgCtx, allowTags)
+			}
+
+			vc.IgnoreList = ignoreTags
+
+			imgLogger.Infof("retrieving information about image")
+
+			vc.Options = options.NewManifestOptions()
+			for _, platform := range platforms {
+				os, arch, variant, err := image.ParsePlatform(platform)
+				if err != nil {
+					imgLogger.Fatalf("Could not parse platform %s: %v", platform, err)
+				}
+				if os != "linux" && os != "windows" {
+					imgLogger.Warnf("Target platform is '%s/%s', but that's not a supported container platform. Forgot --platforms?", os, arch)
+				}
+				vc.Options = vc.Options.WithPlatform(os, arch, variant)
+			}
+			vc.Options = vc.Options.WithMetadata(vc.Strategy.NeedsMetadata())
+
+			// registriesConfPath defaults to "" so we can tell whether the user set it
+			// explicitly. When unset, fall back to the well-known default path only if it
+			// exists as a readable file; otherwise use the built-in in-memory defaults.
+			if registriesConfPath == "" {
+				if st, err := os.Stat(common.DefaultRegistriesConfPath); err == nil && !st.IsDir() {
+					registriesConfPath = common.DefaultRegistriesConfPath
+				} else {
+					imgLogger.Infof("no registries configuration at default path %s, using built-in defaults", common.DefaultRegistriesConfPath)
+				}
+			}
+
+			// The path is now either an explicit user value or a validated default. Any
+			// load error is fatal so misconfiguration is surfaced rather than masked.
+			if registriesConfPath != "" {
+				if err := registry.LoadRegistryConfiguration(imgCtx, registriesConfPath, false); err != nil {
+					imgLogger.Fatalf("could not load registries configuration: %v", err)
+				}
+			}
+
+			ep, err := registry.GetRegistryEndpoint(imgCtx, img)
+			if err != nil {
+				imgLogger.Fatalf("could not get registry endpoint: %v", err)
+			}
+
+			if _, err = ep.SetEndpointCredentials(imgCtx, kubeClient.KubeClient, ""); err != nil {
+				imgLogger.Fatalf("could not set registry credentials: %v", err)
+			}
+
+			checkFlag := func(f *pflag.Flag) {
+				if f.Name == "rate-limit" {
+					imgLogger.Infof("Overriding registry rate-limit to %d requests per second", rateLimit)
+					ep.Limiter = ratelimit.New(rateLimit)
+				}
+			}
+
+			cmd.Flags().Visit(checkFlag)
+
+			var creds *image.Credential
+			var username, password string
+			if credentials != "" {
+				credSrc, err := image.ParseCredentialSource(credentials, false)
+				if err != nil {
+					imgLogger.Fatalf("could not parse credential definition '%s': %v", credentials, err)
+				}
+				creds, err = credSrc.FetchCredentials(imgCtx, ep.RegistryAPI, kubeClient.KubeClient)
+				if err != nil {
+					imgLogger.Fatalf("could not fetch credentials: %v", err)
+				}
+				username = creds.Username
+				password = creds.Password
+			}
+
+			regClient, err := registry.NewClient(ep, username, password)
+			if err != nil {
+				imgLogger.Fatalf("could not create registry client: %v", err)
+			}
+
+			imgLogger.Infof("Fetching available tags and metadata from registry")
+
+			tags, err := ep.GetTags(imgCtx, img, regClient, vc, true)
+			if err != nil {
+				imgLogger.Fatalf("could not get tags: %v", err)
+			}
+
+			imgLogger.Infof("Found %d tags in registry", len(tags.Tags()))
+
+			upImg, err := img.GetNewestVersionFromTags(imgCtx, vc, tags)
+			if err != nil {
+				imgLogger.Fatalf("could not get updateable image from tags: %v", err)
+			}
+			if upImg == nil {
+				imgLogger.Infof("no newer version of image found")
+				return
+			}
+
+			imgLogger.Infof("latest image according to constraint is %s", img.WithTag(upImg))
+		},
+	}
+
+	runCmd.Flags().StringVar(&semverConstraint, "semver-constraint", "", "only consider tags matching semantic version constraint")
+	runCmd.Flags().StringVar(&calverLayout, "calver-layout", "", "layout of the version encoded in the tags, e.g. vYYYY-0M-0D (calver strategy only). When not given, the layout is read from the tag of the image argument, the same way the controller reads it, or defaults to YYYY.0M.0D")
+	runCmd.Flags().StringVar(&allowTags, "allow-tags", "", "only consider tags in registry that satisfy the match function")
+	runCmd.Flags().StringArrayVar(&ignoreTags, "ignore-tags", nil, "ignore tags in registry that match given glob pattern")
+	runCmd.Flags().StringVar(&strategy, "update-strategy", "semver", "update strategy to use (one of semver, newest-build, alphabetical, digest, calver)")
+	runCmd.Flags().StringVar(&registriesConfPath, "registries-conf-path", "", "path to registries configuration")
+	runCmd.Flags().StringVar(&logLevel, "loglevel", "debug", "log level to use (one of trace, debug, info, warn, error)")
+	runCmd.Flags().StringVar(&kubeConfig, "kubeconfig", "", "path to your Kubernetes client configuration")
+	runCmd.Flags().StringVar(&credentials, "credentials", "", "the credentials definition for the test (overrides registry config)")
+	runCmd.Flags().StringSliceVar(&platforms, "platforms", []string{fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)}, "limit images to given platforms")
+	runCmd.Flags().IntVar(&rateLimit, "rate-limit", 20, "specific registry rate limit (overrides registry.conf)")
+	return runCmd
+}

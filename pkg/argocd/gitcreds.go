@@ -1,0 +1,197 @@
+package argocd
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/v3/util/cert"
+
+	"github.com/argoproj-labs/argocd-image-updater/ext/git"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/kube"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/log"
+)
+
+// getGitCredsSource returns git credentials source that loads credentials from the secret or from Argo CD settings
+func getGitCredsSource(ctx context.Context, creds string, kubeClient *kube.ImageUpdaterKubernetesClient, wbc *WriteBackConfig, namespace string) (GitCredsSource, error) {
+	switch {
+	case creds == "repocreds":
+		return func(app *v1alpha1.Application) (git.Creds, error) {
+			return getCredsFromArgoCD(ctx, wbc, app.Spec.Project)
+		}, nil
+	case strings.HasPrefix(creds, "secret:"):
+		return func(app *v1alpha1.Application) (git.Creds, error) {
+			return getCredsFromSecret(wbc, creds[len("secret:"):], kubeClient, namespace)
+		}, nil
+	}
+	return nil, fmt.Errorf("unexpected credentials format. Expected 'repocreds', 'secret:<secret>' or 'secret:<namespace>/<secret>' but got '%s'", creds)
+}
+
+// getCredsFromArgoCD loads repository credentials from Argo CD settings
+// using the shared ArgocdDB instance to avoid creating per-call informer goroutines.
+func getCredsFromArgoCD(ctx context.Context, wbc *WriteBackConfig, project string) (git.Creds, error) {
+	if wbc.ArgocdDB == nil {
+		return nil, fmt.Errorf("argocd database not configured for repository credential lookup")
+	}
+	repo, err := wbc.ArgocdDB.GetRepository(ctx, wbc.GitRepo, project)
+	if err != nil {
+		return nil, err
+	}
+	if !repo.HasCredentials() {
+		return nil, fmt.Errorf("credentials for '%s' are not configured in Argo CD settings", wbc.GitRepo)
+	}
+	creds := GetGitCreds(ctx, repo, wbc.GitCreds)
+	return creds, nil
+}
+
+// GetGitCreds returns the credentials from a repository configuration used to authenticate at a Git repository
+// This is a slightly modified version of upstream's Repository.GetGitCreds method. We need it so it does not return the upstream type.
+// TODO(jannfis): Can be removed once we have the change to the git client's getGitAskPassEnv upstream.
+func GetGitCreds(ctx context.Context, repo *v1alpha1.Repository, store git.CredsStore) git.Creds {
+	if repo == nil {
+		return git.NopCreds{}
+	}
+	if repo.Password != "" {
+		return git.NewHTTPSCreds(repo.Username, repo.Password, repo.TLSClientCertData, repo.TLSClientCertKey, repo.IsInsecure(), repo.Proxy, store, repo.ForceHttpBasicAuth)
+	}
+	if repo.SSHPrivateKey != "" {
+		return git.NewSSHCreds(repo.SSHPrivateKey, getCAPath(ctx, repo.Repo), repo.IsInsecure(), store, repo.Proxy)
+	}
+	if repo.GithubAppPrivateKey != "" && repo.GithubAppId != 0 && repo.GithubAppInstallationId != 0 {
+		return git.NewGitHubAppCreds(repo.GithubAppId, repo.GithubAppInstallationId, repo.GithubAppPrivateKey, repo.GitHubAppEnterpriseBaseURL, repo.Repo, repo.TLSClientCertData, repo.TLSClientCertKey, repo.IsInsecure(), repo.Proxy, store)
+	}
+	if repo.GCPServiceAccountKey != "" {
+		return git.NewGoogleCloudCreds(repo.GCPServiceAccountKey, store)
+	}
+	return git.NopCreds{}
+}
+
+// Taken from upstream Argo CD.
+// TODO(jannfis): Can be removed once we have the change to the git client's getGitAskPassEnv upstream.
+func getCAPath(ctx context.Context, repoURL string) string {
+	log := log.LoggerFromContext(ctx)
+
+	// For git ssh protocol url without ssh://, url.Parse() will fail to parse.
+	// However, no warn log is output since ssh scheme url is a possible format.
+	if ok, _ := git.IsSSHURL(repoURL); ok {
+		return ""
+	}
+
+	hostname := ""
+	// url.Parse() will happily parse most things thrown at it. When the URL
+	// is either https or oci, we use the parsed hostname to retrieve the cert,
+	// otherwise we'll use the parsed path (OCI repos are often specified as
+	// hostname, without protocol).
+	parsedURL, err := url.Parse(repoURL)
+	if err != nil {
+		log.Warnf("Could not parse repo URL '%s': %v", repoURL, err)
+		return ""
+	}
+	if parsedURL.Scheme == "https" || parsedURL.Scheme == "oci" {
+		hostname = parsedURL.Host
+	} else if parsedURL.Scheme == "" {
+		hostname = parsedURL.Path
+	}
+
+	if hostname == "" {
+		log.Warnf("Could not get hostname for repository '%s'", repoURL)
+		return ""
+	}
+
+	caPath, err := cert.GetCertBundlePathForRepository(hostname)
+	if err != nil {
+		log.Warnf("Could not get cert bundle path for repository '%s': %v", repoURL, err)
+		return ""
+	}
+
+	return caPath
+}
+
+// getCredsFromSecret loads repository credentials from secret
+func getCredsFromSecret(wbc *WriteBackConfig, credentialsSecret string, kubeClient *kube.ImageUpdaterKubernetesClient, namespace string) (git.Creds, error) {
+	var credentials map[string][]byte
+	var err error
+	s := strings.SplitN(credentialsSecret, "/", 2)
+	if len(s) == 2 {
+		if s[0] != namespace {
+			return nil, fmt.Errorf("secret namespace '%s' differs from app namespace '%s'", s[0], namespace)
+		}
+		credentials, err = kubeClient.KubeClient.GetSecretData(s[0], s[1])
+		if err != nil {
+			return nil, err
+		}
+	} else if len(s) == 1 {
+		credentials, err = kubeClient.KubeClient.GetSecretData(namespace, s[0])
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, fmt.Errorf("wrong writeBackConfig.method format specified git:secret: '%s'", credentialsSecret)
+	}
+
+	if ok, _ := git.IsSSHURL(wbc.GitRepo); ok {
+		var sshPrivateKey []byte
+		if sshPrivateKey, ok = credentials["sshPrivateKey"]; !ok {
+			return nil, fmt.Errorf("invalid secret %s: does not contain field sshPrivateKey", credentialsSecret)
+		}
+		insecure := parseLegacyInsecure(credentials, credentialsSecret)
+		return git.NewSSHCreds(string(sshPrivateKey), "", insecure, wbc.GitCreds, ""), nil
+	} else if git.IsHTTPSURL(wbc.GitRepo) {
+		var username, password, githubAppID, githubAppInstallationID, githubAppPrivateKey []byte
+		if githubAppID, ok = credentials["githubAppID"]; ok {
+			if githubAppInstallationID, ok = credentials["githubAppInstallationID"]; !ok {
+				return nil, fmt.Errorf("invalid secret %s: does not contain field githubAppInstallationID", credentialsSecret)
+			}
+			if githubAppPrivateKey, ok = credentials["githubAppPrivateKey"]; !ok {
+				return nil, fmt.Errorf("invalid secret %s: does not contain field githubAppPrivateKey", credentialsSecret)
+			}
+			// converting byte array to string and ultimately int64 for NewGitHubAppCreds
+			intGithubAppID, err := strconv.ParseInt(string(githubAppID), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid value in field githubAppID: %w", err)
+			}
+			intGithubAppInstallationID, err := strconv.ParseInt(string(githubAppInstallationID), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid value in field githubAppInstallationID: %w", err)
+			}
+			enterpriseBaseURL := string(credentials["githubAppEnterpriseBaseUrl"])
+			tlsClientCertData := string(credentials["tlsClientCertData"])
+			tlsClientCertKey := string(credentials["tlsClientCertKey"])
+			insecure, _ := strconv.ParseBool(string(credentials["insecure"]))
+			proxy := string(credentials["proxy"])
+			return git.NewGitHubAppCreds(intGithubAppID, intGithubAppInstallationID, string(githubAppPrivateKey), enterpriseBaseURL, wbc.GitRepo, tlsClientCertData, tlsClientCertKey, insecure, proxy, wbc.GitCreds), nil
+		} else if username, ok = credentials["username"]; ok {
+			if password, ok = credentials["password"]; !ok {
+				return nil, fmt.Errorf("invalid secret %s: does not contain field password", credentialsSecret)
+			}
+			insecure := parseLegacyInsecure(credentials, credentialsSecret)
+			return git.NewHTTPSCreds(string(username), string(password), "", "", insecure, "", wbc.GitCreds, false), nil
+		}
+		return nil, fmt.Errorf("invalid repository credentials in secret %s: does not contain githubAppID or username", credentialsSecret)
+	}
+	return nil, fmt.Errorf("unknown repository type")
+}
+
+// parseLegacyInsecure reads the optional "insecure" field of a write-back
+// credentials secret for the SSH and username/password paths. These paths
+// historically skipped host key (SSH) and TLS (HTTPS) verification
+// unconditionally, so an absent field keeps that behavior for backward
+// compatibility. Setting insecure to "false" enables verification: SSH host
+// keys are checked against the mounted ssh_known_hosts, and HTTPS certificates
+// against the system trust store. A value that cannot be parsed keeps the
+// legacy default and logs a warning, so a typo is visible rather than silent.
+func parseLegacyInsecure(credentials map[string][]byte, credentialsSecret string) bool {
+	raw, ok := credentials["insecure"]
+	if !ok {
+		return true
+	}
+	insecure, err := strconv.ParseBool(strings.TrimSpace(string(raw)))
+	if err != nil {
+		log.Warnf("invalid value %q for field insecure in secret %s, keeping the default of skipping verification: %v", string(raw), credentialsSecret, err)
+		return true
+	}
+	return insecure
+}

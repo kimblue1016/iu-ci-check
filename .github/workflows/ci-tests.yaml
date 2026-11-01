@@ -1,0 +1,374 @@
+name: Integration tests
+on:
+  push:
+    branches:
+    - 'master'
+  pull_request:
+    branches:
+    - 'master'
+  # pull_request_target runs in the context of the BASE repo, so repository
+  # secrets ARE available. It fires when a maintainer applies the
+  # "ok-to-test" label to a PR (including fork PRs), allowing E2E tests that
+  # require credentials to run.  The label acts as the security gate: only
+  # maintainers with "Triage" role or above can apply it.
+  pull_request_target:
+    types: [labeled]
+    branches:
+    - 'master'
+  # workflow_dispatch lets maintainers trigger the full suite (including E2E)
+  # manually from the Actions UI or via the GitHub CLI.
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-go:
+    name: Ensure Go modules synchronicity
+    # Skip on label events and push-to-master (already passed pre-merge).
+    if: github.event_name != 'pull_request_target' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Download all Go modules
+        run: |
+          go mod download
+      - name: Check for tidyness of go.mod and go.sum
+        run: |
+          go mod tidy
+          git diff --exit-code -- .
+  codegen:
+    name: Run codegen
+    if: github.event_name != 'pull_request_target' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Install Kustomize v2
+        run: |
+          set -xo pipefail
+          URL="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.1.0/kustomize_v5.1.0_linux_amd64.tar.gz"
+          BINNAME=kustomize
+          curl -sLf --retry 3 -o /tmp/kustomize.tar.gz "$URL"
+          chksum=$(sha256sum /tmp/kustomize.tar.gz | awk '{ print $1; }')
+          if test "${chksum}" != "52f4cf1ba34d38fd55a9bef819e329c9a4561f5f57f8f539346038ab5026dda8"; then
+            echo "Checksum mismatch" >&2
+            exit 1
+          fi
+          tar -C /tmp -xvzf /tmp/kustomize.tar.gz
+          sudo mv /tmp/kustomize /usr/local/bin/kustomize
+          chmod +x /usr/local/bin/kustomize
+      - name: Run make build-installer
+        run: |
+          IMAGE_TAG=latest make build-installer
+      - name: Check nothing has changed
+        run: |
+          set -xo pipefail
+          git diff --exit-code -- . ':!go.sum' ':!go.mod' ':!assets/swagger.json' | tee codegen.patch
+  lint:
+    name: Ensure code is correctly linted
+    if: github.event_name != 'pull_request_target' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+        env:
+          GO111MODULE: off
+      - name: Run golangci-lint on main module
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          args: --timeout 5m
+      - name: Run golangci-lint on registry-scanner
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          args: --timeout 5m
+          working-directory: registry-scanner
+  test:
+    name: Ensure unit tests are passing
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run tests
+        env:
+          GNUPG_DISABLED: true
+        run: |
+          make test
+      - name: Upload code coverage information to codecov.io
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
+          flags: unit-tests
+
+# Comment out test-manifests job for now since image-updater crd schema is not available to the kubeconform tool yet
+#  test-manifests:
+#    name: Ensure kubernetes manifests conform to their schema
+#    runs-on: ubuntu-latest
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#      - name: Install Kubeconform
+#        run: |
+#          set -xo pipefail
+#
+#          curl -sLf --retry 3 \
+#            -o /tmp/kubeconform.tar.gz \
+#            "https://github.com/yannh/kubeconform/releases/download/v0.6.6/kubeconform-linux-amd64.tar.gz"
+#          chksum=$(sha256sum /tmp/kubeconform.tar.gz | awk '{ print $1; }')
+#          if test "${chksum}" != "2ff56999a6ed9e96fe5ab9ee52271f2db5335baf7f17789035b9561970cdd3eb"; then
+#            echo "Checksum mismatch" >&2
+#            exit 1
+#          fi
+#
+#          tar -C /tmp -xvzf /tmp/kubeconform.tar.gz
+#          sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
+#          chmod +x /usr/local/bin/kubeconform
+#      - name: Run manifest tests
+#        run: |
+#          make test-manifests
+
+  registry-scanner:
+    name: Ensure registry-scanner Go modules synchronicity and run tests
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./registry-scanner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Download all Go modules
+        run: |
+          go mod download
+      - name: Check for tidyness of go.mod and go.sum
+        run: |
+          go mod tidy
+          git diff --exit-code -- .
+      - name: Run tests
+        env:
+          GNUPG_DISABLED: true
+        run: |
+          make test
+      - name: Upload code coverage information to codecov.io
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
+          flags: unit-tests
+  test-e2e:
+    name: Run end-to-end tests
+    # At most one E2E run per PR at a time.  When a pull_request_target run
+    # (triggered by the "ok-to-test" label) starts while a pull_request run
+    # for the same PR is already in flight, the older run is cancelled so the
+    # new one — which carries real secrets — takes its place immediately.
+    # For workflow_dispatch and push events github.event.pull_request.number is
+    # empty, so the group falls back to github.ref (e.g. refs/heads/master).
+    concurrency:
+      group: e2e-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    # Execution policy:
+    #
+    #  pull_request from the SAME repo  → run (secrets are available, all tests execute).
+    #  pull_request from a FORK         → SKIP entirely.
+    #    Skipped jobs show as neutral (grey) on the PR — not as a red cancelled check.
+    #    A fork PR should get its secrets-bearing run via pull_request_target below.
+    #
+    #  pull_request_target + ok-to-test → run (secrets injected by GitHub for any PR,
+    #    including forks; label is the maintainer-controlled security gate).
+    #
+    #  workflow_dispatch                 → run unconditionally (manual trigger).
+    #
+    # The concurrency group (e2e-<PR-number>) still prevents duplicate runs when a
+    # same-repo PR triggers both pull_request and pull_request_target simultaneously.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_target' && github.event.label.name == 'ok-to-test')
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      matrix:
+        k3s-version: [ v1.27.1 ]
+        # k3s-version: [v1.20.2, v1.19.2, v1.18.9, v1.17.11, v1.16.15]
+    steps:
+      - name: Free up disk space
+        run: |
+          # Free up disk space on GitHub Actions runner to avoid pod evictions
+          # See: https://github.com/actions/runner-images/issues/2840
+          echo "=== Disk space before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+          echo "=== Disk space after cleanup ==="
+          df -h /
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          allow-unsafe-pr-checkout: true
+          persist-credentials: false
+          # For pull_request_target, check out the contributor's commit rather
+          # than the base branch (which is the default for that event).
+          # github.event.pull_request.head.sha is set for both pull_request and
+          # pull_request_target; it falls back to github.sha for workflow_dispatch.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'test/ginkgo/go.mod'
+      - name: GH actions workaround - Kill XSP4 process
+        run: |
+          sudo pkill mono || true
+      - name: Restore go build cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-go-build-v1-${{ github.run_id }}
+      - name: Add /usr/local/bin to PATH
+        run: |
+          echo "/usr/local/bin" >> $GITHUB_PATH
+      - name: Download Go dependencies
+        run: |
+          cd test/ginkgo && go mod download
+      - name: Install K3D
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rancher/k3d/main/install.sh | bash
+          sudo mkdir -p "$HOME/.kube" && sudo chown -R runner "$HOME/.kube"
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Deploy operator and run e2e tests
+        env:
+          ARGOCD_CLUSTER_CONFIG_NAMESPACES: argocd-e2e-cluster-config, argocd-operator-system
+          K3D_CLUSTER_NAME: k3s-default
+          LOCAL: false
+          # GitHub PR E2E credentials.
+          # When absent (e.g. fork PRs where secrets are not exposed) the
+          # test is automatically skipped via Ginkgo's Skip() call.
+          E2E_GITHUB_TOKEN:  ${{ secrets.E2E_GITHUB_TOKEN }}
+          E2E_GITHUB_OWNER:  ${{ secrets.E2E_GITHUB_OWNER }}
+          E2E_GITHUB_REPO:   ${{ secrets.E2E_GITHUB_REPO }}
+          E2E_GITHUB_BRANCH: ${{ secrets.E2E_GITHUB_BRANCH }}
+        run: |
+          set -o pipefail
+          make -C test/ginkgo test-e2e 2>&1 | tee /tmp/e2e-test-ginkgo.log
+
+      - name: Save application controller and server logs
+        if: ${{ failure() }}
+        run: |
+          # Collect logs from test namespaces. The ginkgo tests use dynamically generated
+          # namespace names with the prefix 'gitops-e2e-test-'.
+          set -x
+
+          # Find all gitops-e2e-test-* namespaces
+          E2E_NAMESPACES=$(kubectl get namespaces -o=name | grep 'gitops-e2e-test-' | sed 's|namespace/||' || true)
+
+          if [ -n "$E2E_NAMESPACES" ]; then
+            for NS in $E2E_NAMESPACES; do
+              echo "--- Collecting resources from namespace $NS ---"
+              kubectl get all -n "$NS" >> /tmp/pods.log 2>&1 || true
+
+              # Collect application controller logs (use head -1 to get only first matching pod)
+              APP_CONTROLLER=$(kubectl get po -n "$NS" -o=name 2>/dev/null | grep argocd-application-controller | head -1 || true)
+              if [ -n "$APP_CONTROLLER" ]; then
+                kubectl logs -n "$NS" "$APP_CONTROLLER" >> /tmp/e2e-application-controller.log 2>&1 || true
+              fi
+
+              # Collect server logs (use head -1 to get only first matching pod)
+              SERVER_POD=$(kubectl get po -n "$NS" -o=name 2>/dev/null | grep argocd-server | head -1 || true)
+              if [ -n "$SERVER_POD" ]; then
+                kubectl logs -n "$NS" "$SERVER_POD" >> /tmp/e2e-server.log 2>&1 || true
+                kubectl describe -n "$NS" "$SERVER_POD" >> /tmp/e2e-server.log 2>&1 || true
+              fi
+
+              # Collect image updater logs (use head -1 to get only first matching pod)
+              IMAGE_UPDATER_POD=$(kubectl get po -n "$NS" -o=name 2>/dev/null | grep 'image-updater' | head -1 || true)
+              if [ -n "$IMAGE_UPDATER_POD" ]; then
+                kubectl logs -n "$NS" "$IMAGE_UPDATER_POD" >> /tmp/e2e-image-updater.log 2>&1 || true
+              fi
+            done
+          fi
+
+          # Collect operator logs from argocd-operator-system namespace
+          echo "--- Operator pods status ---" > /tmp/e2e-operator-run.log
+          kubectl get pods -n argocd-operator-system -o wide >> /tmp/e2e-operator-run.log 2>&1 || true
+          echo "" >> /tmp/e2e-operator-run.log
+
+          # Collect logs from all operator pods (there might be multiple due to restarts)
+          echo "--- Operator pod logs ---" >> /tmp/e2e-operator-run.log
+          for pod in $(kubectl get po -n argocd-operator-system -o=name 2>/dev/null | grep controller-manager || true); do
+            echo "" >> /tmp/e2e-operator-run.log
+            echo "=== Logs from $pod ===" >> /tmp/e2e-operator-run.log
+            kubectl logs -n argocd-operator-system "$pod" -c manager --tail=500 >> /tmp/e2e-operator-run.log 2>&1 || true
+            # Also try previous container logs if pod restarted
+            kubectl logs -n argocd-operator-system "$pod" -c manager --previous --tail=200 >> /tmp/e2e-operator-run.log 2>&1 || true
+          done
+
+          echo "" >> /tmp/e2e-operator-run.log
+          echo "--- Operator deployment status ---" >> /tmp/e2e-operator-run.log
+          kubectl get deployment -n argocd-operator-system -o yaml >> /tmp/e2e-operator-run.log 2>&1 || true
+
+      - name: Upload operator logs
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-operator-run-${{ matrix.k3s-version }}.log
+          path: /tmp/e2e-operator-run.log
+        if: ${{ failure() }}
+
+      - name: Upload ginkgo test logs
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-test-${{ matrix.k3s-version }}.log
+          path: /tmp/e2e-test-ginkgo.log
+        if: ${{ failure() }}
+
+      - name: Upload application controller logs
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-application-controller-${{ matrix.k3s-version }}.log
+          path: /tmp/e2e-application-controller.log
+        if: ${{ failure() }}
+
+      - name: Upload server logs
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-server-${{ matrix.k3s-version }}.log
+          path: /tmp/e2e-server.log
+        if: ${{ failure() }}
+
+      - name: Upload image updater logs
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-image-updater-${{ matrix.k3s-version }}.log
+          path: /tmp/e2e-image-updater.log
+        if: ${{ failure() }}
+
+      - name: Upload pod descriptions
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-pods-${{ matrix.k3s-version }}.log
+          path: /tmp/pods.log
+        if: ${{ failure() }}

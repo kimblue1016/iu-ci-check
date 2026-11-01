@@ -1,0 +1,99 @@
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  labels:
+    app.kubernetes.io/name: argocd-image-updater
+    app.kubernetes.io/managed-by: kustomize
+  name: argocd-image-updater-sample
+  namespace: argocd
+spec:
+  commonUpdateSettings:
+    updateStrategy: "semver" # Default strategy if not specified per image
+    forceUpdate: true
+    allowTags: "regexp:^[0-9a-f]{7}$"
+    ignoreTags: [ "latest", "master" ]
+    pullSecret: "secret:<namespace>/<secret_name>#<field>"
+    platforms: [ "linux/arm64", "linux/amd64" ]
+  writeBackConfig:
+    method: "git:secret:git-creds"
+    gitConfig: # Group git-related settings. Should be ignored when writeBackMethod: "argocd"
+      repository: "git@github.com:example/example.git"
+      branch: "main"
+      writeBackTarget: "helmvalues:/helm/config/test-values.yaml" # OR "kustomization:/config/overlays/bar" OR "helmvalues:/{{ .app.path.path }}/values.yaml" - for ApplicationSet.
+  applicationRefs:
+    - namePattern: "*"
+      useAnnotations: true
+      labelSelectors:
+        matchLabels:
+          image-updater: my-image-updater
+    - namePattern: "app-001"
+      images:
+        - alias: "test1"
+          imageName: "test:1.1.0"
+    - namePattern: "app-002"
+      commonUpdateSettings:
+        updateStrategy: "newest-build" # Default strategy if not specified per image
+        forceUpdate: true
+        allowTags: "regexp:^[0-9a-f]{7}$"
+        ignoreTags: [ "latest", "master" ]
+        pullSecret: "secret:<namespace>/<secret_name>#<field>"
+        platforms: [ "linux/arm64", "linux/amd64" ]
+      writeBackConfig:
+        method: "git:secret:git-creds"
+        gitConfig: # Group git-related settings. Should be ignored when writeBackMethod: "argocd"
+          repository: "git@github.com:example/example.git"
+          branch: "main"
+          writeBackTarget: "helmvalues:/helm/config/test-values.yaml" # OR "kustomization:/config/overlays/bar" OR "helmvalues:/{{ .app.path.path }}/values.yaml" - for ApplicationSet.
+      images:
+        - alias: "test1"
+          imageName: "test1:1.1.0"
+        - alias: "test2"
+          imageName: "test2:2.2.0"
+        - alias: "nginx" # Maps to current '<alias>=' part of image-list annotation. Should clearly separate the image name (for registry) from its initial version/tag. What we are currently using before = sign (image=image:version)
+          imageName: "nginx:1.17.10" # The actual image name for registry lookup OR 10.42.0.1:30000/test-image:latest
+          commonUpdateSettings:
+            updateStrategy: "semver" # Per-image override
+            forceUpdate: true
+            allowTags: "regexp:^[0-9a-f]{7}$"
+            ignoreTags: [ "latest", "master" ]
+            pullSecret: "secret:<namespace>/<secret_name>#<field>"
+            platforms: [ "linux/arm64", "windows" ]
+          manifestTargets:
+            helm:
+              name: "dex.image.name"
+              tag: "dex.image.tag" # e.g., for nginx.image.repository
+              spec: "image/name:1.0"
+      #        kustomize:
+      #          name: "quay.io/argoproj/argocd"
+
+    - namePattern: "app-*"
+      labelSelectors:
+        matchLabels:
+          app: "true"
+        matchExpressions:
+          - key: "key"
+            operator: In
+            values:
+              - "value1"
+              - "value2"
+      images:
+        - alias: "nginx"
+          imageName: "nginx:1.17.10"
+    - namePattern: "app-003"
+      images:
+        - alias: "nginx"
+          imageName: "nginx:1.17.10"
+      commonUpdateSettings:
+        updateStrategy: "newest-build" # Default strategy if not specified per image
+        forceUpdate: true
+        allowTags: "regexp:^[0-9a-f]{7}$"
+        ignoreTags: [ "latest", "master" ]
+        pullSecret: "secret:<namespace>/<secret_name>#<field>"
+      writeBackConfig:
+        method: "git:secret:git-creds"
+        gitConfig: # Group git-related settings. Should be ignored when writeBackMethod: "argocd"
+          repository: "git@github.com:example/example.git"
+          branch: "main"
+          writeBackTarget: "helmvalues:/helm/config/test-values.yaml" # OR "kustomization:/config/overlays/bar" OR "helmvalues:/{{ .app.path.path }}/values.yaml" - for ApplicationSet.
+    # Image List for the App and Per-Image Overrides
+    # (Maps to argocd-image-updater.argoproj.io/image-list and <alias>.* annotations)

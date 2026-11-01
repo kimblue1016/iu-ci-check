@@ -1,0 +1,23 @@
+.vscode/
+.idea/
+.DS_Store
+**/vendor/
+dist/
+site/
+*.iml
+# delve debug binaries
+cmd/**/debug
+debug.test
+**/coverage.out
+test-results
+.scannerwork
+.scratch
+*.goe
+**/kuttl-test.json
+**/kubeconfig
+# Private keys and certificates (should be generated at runtime, not committed)
+*.key
+*.crt
+# htpasswd files (should be generated at runtime, not committed)
+**/htpasswd
+test/ginkgo/prereqs/assets/cosign

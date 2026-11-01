@@ -1,0 +1,59 @@
+version: "2"
+linters:
+  enable:
+    - misspell
+    - unconvert
+    - ineffassign
+    - unused
+    - govet
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters: [staticcheck]
+        text: "ST1001" # dot imports - common practice in Ginkgo/Gomega tests for readability
+        path: "test/"
+    paths:
+      - .*\.pb\.go
+      - vendor/
+      - third_party$
+      - builtin$
+      - examples$
+  settings:
+    govet:
+      disable:
+        # TODO: re-enable after golangci-lint supports generics in inline analyzer
+        - inline # false positives on generic stdlib functions (slices.SortFunc, etc.)
+    staticcheck:
+      checks:
+        - all
+        - '-QF1003'
+        - '-QF1008'
+        - '-QF1011'
+        - '-QF1012'
+        - '-ST1003'
+        - '-ST1005'
+        - '-ST1016'
+        - '-ST1023'
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/argoproj-labs/argocd-image-updater
+  exclusions:
+    generated: lax
+    paths:
+      - .*\.pb\.go
+      - vendor/
+      - third_party$
+      - builtin$
+      - examples$
+run: 
+  timeout: 5m

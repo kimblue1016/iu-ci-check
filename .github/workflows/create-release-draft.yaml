@@ -1,0 +1,59 @@
+name: Create release draft
+on:
+  workflow_dispatch:
+  pull_request:
+    types:
+    - closed
+    branches:
+    - 'release-*'
+
+jobs:
+  create-draft:
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'release')
+    name: Create release draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Get version
+        id: version
+        run: |
+          echo version=$(cat VERSION) >> $GITHUB_OUTPUT
+
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        id: binaries
+        run: |
+          make release-binaries
+
+      - name: Setup qemu
+        uses: docker/setup-qemu-action@v4
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and possibly push image
+        run: |
+          set -ex
+          docker login --username "${DOCKER_USERNAME}" --password "${DOCKER_PASSWORD}" quay.io
+          IMAGE_PUSH=yes IMAGE_TAG=v${{ steps.version.outputs.version }} make docker-buildx
+        env:
+          DOCKER_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.QUAY_TOKEN }}
+
+      - name: Create release draft
+        id: create-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            --title "v${{ steps.version.outputs.version }}" \
+            --target "${{ github.base_ref }}" \
+            --draft \
+            dist/release/*

@@ -1,0 +1,763 @@
+package argocd
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	argocdapi "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	gogithub "github.com/google/go-github/v69/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/argoproj-labs/argocd-image-updater/ext/git"
+)
+
+// --- mock types shared by commitChangesPR tests ---
+
+// mockGitClient stubs all git.Client methods. Set initErr to simulate a
+// failure at the earliest point inside commitChangesGit.
+type mockGitClient struct {
+	root    string
+	initErr error
+	// shallowFetchErr, when set, is consulted per ShallowFetch call so a test
+	// can simulate a branch that does not exist on the remote.
+	shallowFetchErr func(branch string) error
+}
+
+func (m *mockGitClient) Root() string                            { return m.root }
+func (m *mockGitClient) Init(_ context.Context) error            { return m.initErr }
+func (m *mockGitClient) Fetch(_ context.Context, _ string) error { return nil }
+func (m *mockGitClient) ShallowFetch(_ context.Context, branch string, _ int) error {
+	if m.shallowFetchErr != nil {
+		return m.shallowFetchErr(branch)
+	}
+	return nil
+}
+func (m *mockGitClient) Submodule(_ context.Context) error                    { return nil }
+func (m *mockGitClient) Checkout(_ context.Context, _ string, _ bool) error   { return nil }
+func (m *mockGitClient) LsRefs(_ context.Context) (*git.Refs, error)          { return &git.Refs{}, nil }
+func (m *mockGitClient) LsRemote(_ context.Context, _ string) (string, error) { return "", nil }
+func (m *mockGitClient) LsFiles(_ context.Context, _ string, _ bool) ([]string, error) {
+	return nil, nil
+}
+func (m *mockGitClient) LsLargeFiles(_ context.Context) ([]string, error) { return nil, nil }
+func (m *mockGitClient) CommitSHA(_ context.Context) (string, error)      { return "", nil }
+func (m *mockGitClient) RevisionMetadata(_ context.Context, _ string) (*git.RevisionMetadata, error) {
+	return nil, nil
+}
+func (m *mockGitClient) VerifyCommitSignature(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (m *mockGitClient) IsAnnotatedTag(_ context.Context, _ string) bool { return false }
+func (m *mockGitClient) ChangedFiles(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockGitClient) WorkingTreeChanges(_ context.Context) ([]git.WorkingTreeChange, error) {
+	return nil, nil
+}
+func (m *mockGitClient) Commit(_ context.Context, _ string, _ *git.CommitOptions) error { return nil }
+func (m *mockGitClient) Branch(_ context.Context, _, _ string) error                    { return nil }
+func (m *mockGitClient) Push(_ context.Context, _, _ string, _ bool) error              { return nil }
+func (m *mockGitClient) Add(_ context.Context, _ string) error                          { return nil }
+func (m *mockGitClient) SymRefToBranch(_ context.Context, _ string) (string, error) {
+	return "main", nil
+}
+func (m *mockGitClient) Config(_ context.Context, _, _ string) error { return nil }
+
+// mockGitAndSCMCreds implements both git.Creds (required return type of
+// GetCreds) and git.SCMTokenProvider (required by commitChangesPR).
+type mockGitAndSCMCreds struct {
+	token string
+}
+
+func (m *mockGitAndSCMCreds) Environ(_ context.Context) (io.Closer, []string, error) {
+	return io.NopCloser(bytes.NewReader(nil)), nil, nil
+}
+
+func (m *mockGitAndSCMCreds) SCMToken(_ context.Context) (string, error) {
+	return m.token, nil
+}
+
+// noopWriter is a changeWriter that reports changes were written (skip=false),
+// letting commitChangesGit proceed through the (mocked) commit/push steps so
+// the PR/MR creation logic below it can be exercised.
+func noopWriter(_ context.Context, _ *ApplicationImages, _ git.Client) (error, bool) {
+	return nil, false
+}
+
+// noChangesWriter is a changeWriter that reports no changes were found
+// (skip=true), simulating a write-back target that already has the desired
+// value (e.g. forceUpdate re-evaluating an already-correct image).
+// commitChangesGit returns immediately after calling write when skip=true,
+// but only after buildPullRequest has already populated wbc.PullRequest.
+func noChangesWriter(_ context.Context, _ *ApplicationImages, _ git.Client) (error, bool) {
+	return nil, true
+}
+
+// makeTestAppImages builds a minimal ApplicationImages for commitChangesPR tests.
+func makeTestAppImages(wbc *WriteBackConfig) *ApplicationImages {
+	var app argocdapi.Application
+	app.Name = "test-app"
+	app.Namespace = "test-ns"
+	return &ApplicationImages{
+		Application:     app,
+		WriteBackConfig: wbc,
+	}
+}
+
+// --- Test_buildPullRequest ---
+
+func Test_buildPullRequest(t *testing.T) {
+	ctx := context.Background()
+	const (
+		ns         = "my-namespace"
+		name       = "my-app"
+		baseBranch = "main"
+		headBranch = "image-updater-my-namespace-my-app"
+	)
+
+	tests := []struct {
+		name          string
+		commitMessage string
+		wantTitle     string
+		wantBody      string
+		wantHead      string
+		wantBase      string
+	}{
+		{
+			name:      "empty commit message produces default title and body",
+			wantTitle: "chore: update images for my-namespace/my-app",
+			wantBody:  "This pull request was created automatically by argocd-image-updater for application my-namespace/my-app.",
+			wantHead:  headBranch,
+			wantBase:  baseBranch,
+		},
+		{
+			name:          "single-line message sets title, body is empty",
+			commitMessage: "build: update nginx to 1.5",
+			wantTitle:     "build: update nginx to 1.5",
+			wantBody:      "",
+			wantHead:      headBranch,
+			wantBase:      baseBranch,
+		},
+		{
+			name:          "multi-line message splits into title and body",
+			commitMessage: "build: update nginx\n\nupdates nginx tag '1.0' → '1.5'",
+			wantTitle:     "build: update nginx",
+			wantBody:      "updates nginx tag '1.0' → '1.5'",
+			wantHead:      headBranch,
+			wantBase:      baseBranch,
+		},
+		{
+			name:          "leading/trailing whitespace is trimmed from title and body",
+			commitMessage: "  trimmed title  \n  trimmed body  ",
+			wantTitle:     "trimmed title",
+			wantBody:      "trimmed body",
+			wantHead:      headBranch,
+			wantBase:      baseBranch,
+		},
+		{
+			name:          "title over 255 characters is truncated",
+			commitMessage: strings.Repeat("x", 300),
+			wantTitle:     strings.Repeat("x", 255),
+			wantBody:      "",
+			wantHead:      headBranch,
+			wantBase:      baseBranch,
+		},
+		{
+			name:          "body over 65536 characters is truncated",
+			commitMessage: "title\n" + strings.Repeat("y", 70000),
+			wantTitle:     "title",
+			wantBody:      strings.Repeat("y", 65536),
+			wantHead:      headBranch,
+			wantBase:      baseBranch,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wbc := &WriteBackConfig{GitCommitMessage: tt.commitMessage}
+			pr, err := buildPullRequest(ctx, wbc, ns, name, baseBranch, headBranch)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantTitle, pr.title)
+			assert.Equal(t, tt.wantBody, pr.body)
+			assert.Equal(t, tt.wantHead, pr.head)
+			assert.Equal(t, tt.wantBase, pr.base)
+		})
+	}
+
+	t.Run("labels are carried from the write-back config", func(t *testing.T) {
+		wbc := &WriteBackConfig{PRLabels: []string{"image-update", "automated"}}
+		pr, err := buildPullRequest(ctx, wbc, ns, name, baseBranch, headBranch)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"image-update", "automated"}, pr.labels)
+	})
+
+	t.Run("no labels configured leaves PR labels empty", func(t *testing.T) {
+		pr, err := buildPullRequest(ctx, &WriteBackConfig{}, ns, name, baseBranch, headBranch)
+		require.NoError(t, err)
+		assert.Empty(t, pr.labels)
+	})
+}
+
+// --- Test_commitChangesLocked_PRReservation ---
+
+func Test_commitChangesLocked_PRReservation(t *testing.T) {
+	ctx := context.Background()
+
+	// newServer returns a GitHub API stub reporting no open PRs and counting
+	// PR creations.
+	newServer := func(created *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]*gogithub.PullRequest{})
+				return
+			}
+			created.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(gogithub.PullRequest{Number: new(1)})
+		}))
+	}
+
+	// newWbc returns a PR write-back config for the same target key on every
+	// call, using the given git client.
+	newWbc := func(serverURL string, gitC git.Client) *WriteBackConfig {
+		return &WriteBackConfig{
+			Method:     WriteBackGit,
+			GitRepo:    serverURL + "/org/repo.git",
+			GitBranch:  "main",
+			Target:     ".argocd-source-test-app.yaml",
+			PRProvider: PRProviderGitHub,
+			GitClient:  gitC,
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "github-token"}, nil
+			},
+		}
+	}
+
+	// newAppImages returns a Kustomize application for the given config.
+	newAppImages := func(wbc *WriteBackConfig) *ApplicationImages {
+		ai := makeTestAppImages(wbc)
+		ai.Application.Spec.Source = &argocdapi.ApplicationSource{
+			Kustomize: &argocdapi.ApplicationSourceKustomize{
+				Images: argocdapi.KustomizeImages{"jannfis/foobar:1.0.1"},
+			},
+		}
+		ai.Application.Status.SourceType = argocdapi.ApplicationSourceTypeKustomize
+		return ai
+	}
+
+	// Only the base branch exists on the remote, so the head branch is
+	// created locally.
+	localHeadOnly := func(branch string) error {
+		if branch == "main" {
+			return nil
+		}
+		return fmt.Errorf("couldn't find remote ref %s", branch)
+	}
+
+	t.Run("reservation is released when nothing was pushed", func(t *testing.T) {
+		var created atomic.Int32
+		server := newServer(&created)
+		defer server.Close()
+		state := NewSyncIterationState()
+
+		// Application A: the target file already has the desired content, so
+		// the write-back produces no diff and nothing is pushed.
+		rootA := t.TempDir()
+		wbcA := newWbc(server.URL, &mockGitClient{root: rootA, shallowFetchErr: localHeadOnly})
+		aiA := newAppImages(wbcA)
+		current, err := marshalParamsOverride(ctx, aiA, nil)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(rootA, wbcA.Target), current, 0600))
+		err = commitChangesLocked(ctx, aiA, state, nil)
+		require.NoError(t, err)
+		assert.Equal(t, int32(0), created.Load())
+
+		// Application B: same write-back target, the target file does not
+		// exist yet, so there is a real change to push.
+		wbcB := newWbc(server.URL, &mockGitClient{root: t.TempDir(), shallowFetchErr: localHeadOnly})
+		require.Equal(t, wbcA.WriteBackTargetKey(), wbcB.WriteBackTargetKey())
+		err = commitChangesLocked(ctx, newAppImages(wbcB), state, nil)
+		require.NoError(t, err)
+		assert.Equal(t, int32(1), created.Load(),
+			"B must still open a PR for the target when A pushed nothing")
+	})
+
+	t.Run("reservation is retained when the write-back fails", func(t *testing.T) {
+		var created atomic.Int32
+		server := newServer(&created)
+		defer server.Close()
+		state := NewSyncIterationState()
+
+		wbcA := newWbc(server.URL, &mockGitClient{initErr: fmt.Errorf("init failed")})
+		err := commitChangesLocked(ctx, newAppImages(wbcA), state, nil)
+		require.Error(t, err)
+
+		wbcB := newWbc(server.URL, &mockGitClient{root: t.TempDir(), shallowFetchErr: localHeadOnly})
+		err = commitChangesLocked(ctx, newAppImages(wbcB), state, nil)
+		require.NoError(t, err)
+		assert.Equal(t, int32(0), created.Load(),
+			"B must be skipped while A holds the reservation")
+		assert.False(t, state.MarkPRCreated(wbcB.WriteBackTargetKey()))
+	})
+
+	t.Run("reservation is retained when a PR was created", func(t *testing.T) {
+		var created atomic.Int32
+		server := newServer(&created)
+		defer server.Close()
+		state := NewSyncIterationState()
+
+		wbcA := newWbc(server.URL, &mockGitClient{root: t.TempDir(), shallowFetchErr: localHeadOnly})
+		err := commitChangesLocked(ctx, newAppImages(wbcA), state, nil)
+		require.NoError(t, err)
+
+		wbcB := newWbc(server.URL, &mockGitClient{root: t.TempDir(), shallowFetchErr: localHeadOnly})
+		err = commitChangesLocked(ctx, newAppImages(wbcB), state, nil)
+		require.NoError(t, err)
+		assert.Equal(t, int32(1), created.Load(), "only one PR per target per cycle")
+	})
+}
+
+// --- Test_commitChangesPR ---
+
+func Test_commitChangesPR(t *testing.T) {
+	ctx := context.Background()
+
+	// --- precondition checks (fail before commitChangesGit is called) ---
+
+	t.Run("unsupported PR provider", func(t *testing.T) {
+		wbc := &WriteBackConfig{
+			GitRepo:    "https://github.com/org/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProvider(99), // truly unsupported
+			GitClient:  &mockGitClient{},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "token"}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported PR provider")
+	})
+
+	t.Run("GetCreds fails — rejected before git push", func(t *testing.T) {
+		// No GitClient needed: GetCreds is called before commitChangesGit.
+		wbc := &WriteBackConfig{
+			GitRepo:    "https://github.com/org/repo.git",
+			PRProvider: PRProviderGitHub,
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return nil, fmt.Errorf("secret not found")
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "could not get creds")
+	})
+
+	t.Run("creds do not implement SCMTokenProvider — rejected before git push", func(t *testing.T) {
+		// No GitClient needed: the type-assertion fires before commitChangesGit.
+		wbc := &WriteBackConfig{
+			GitRepo:    "https://github.com/org/repo.git",
+			PRProvider: PRProviderGitHub,
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				// NopCreds satisfies git.Creds but NOT git.SCMTokenProvider.
+				return git.NopCreds{}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "do not support PR creation")
+	})
+
+	// --- git push phase ---
+
+	t.Run("commitChangesGit fails: git init error", func(t *testing.T) {
+		wbc := &WriteBackConfig{
+			GitRepo:    "https://github.com/org/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitHub,
+			GitClient:  &mockGitClient{initErr: fmt.Errorf("init failed")},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "token"}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "init failed")
+	})
+
+	t.Run("no changes, head branch only local: PR/MR creation is skipped, no error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				// exists: no existing PRs, so commitChangesPR proceeds to commitChangesGit.
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]*gogithub.PullRequest{})
+				return
+			}
+			t.Error("create must not be called for a head branch that was never pushed")
+		}))
+		defer server.Close()
+
+		wbc := &WriteBackConfig{
+			GitRepo:    server.URL + "/org/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitHub,
+			GitClient: &mockGitClient{
+				// Only the base branch exists on the remote; fetching the
+				// templated head branch fails, so commitChangesGit creates it
+				// locally. This is the "couldn't find remote ref" sequence that
+				// used to end in a 422 from the PR API.
+				shallowFetchErr: func(branch string) error {
+					if branch == "main" {
+						return nil
+					}
+					return fmt.Errorf("couldn't find remote ref %s", branch)
+				},
+			},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "github-token"}, nil
+			},
+		}
+		nothingPushed, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noChangesWriter)
+		require.NoError(t, err)
+		assert.True(t, nothingPushed)
+	})
+
+	t.Run("no changes but head branch already on remote: PR/MR is still created", func(t *testing.T) {
+		var created atomic.Bool
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				// exists: no open PR, e.g. a previous create() failed after the push.
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]*gogithub.PullRequest{})
+				return
+			}
+			created.Store(true)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(gogithub.PullRequest{Number: new(1)})
+		}))
+		defer server.Close()
+
+		wbc := &WriteBackConfig{
+			GitRepo:    server.URL + "/org/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitHub,
+			// Every ShallowFetch succeeds, so the head branch is fetched from
+			// the remote rather than created locally: it already carries the
+			// desired change even though this cycle wrote no diff.
+			GitClient: &mockGitClient{},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "github-token"}, nil
+			},
+		}
+		nothingPushed, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noChangesWriter)
+		require.NoError(t, err)
+		assert.False(t, nothingPushed)
+		assert.True(t, created.Load(),
+			"a PR must still be opened for a head branch that is already pushed, "+
+				"so a create() that failed on an earlier cycle is retried")
+	})
+
+	// --- GitHub API phase ---
+
+	t.Run("GitHub: PR created successfully", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				// exists: no existing PRs
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]*gogithub.PullRequest{})
+				return
+			}
+			assert.Equal(t, http.MethodPost, r.Method)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(gogithub.PullRequest{
+				Number:  new(1),
+				HTMLURL: new("http://example.com/pull/1"),
+			})
+		}))
+		defer server.Close()
+
+		wbc := &WriteBackConfig{
+			GitRepo:    server.URL + "/org/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitHub,
+			GitClient:  &mockGitClient{},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "github-token"}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.NoError(t, err)
+	})
+
+	t.Run("GitHub: PR already exists — treated as no-op, no error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				// exists: an existing open PR
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]*gogithub.PullRequest{{Number: new(42)}})
+				return
+			}
+			// create should not be reached because exists found an existing PR
+			t.Error("create should not be called when exists finds an existing PR")
+		}))
+		defer server.Close()
+
+		wbc := &WriteBackConfig{
+			GitRepo:    server.URL + "/org/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitHub,
+			GitClient:  &mockGitClient{},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "github-token"}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.NoError(t, err)
+	})
+
+	t.Run("GitHub: create fails with 422", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				// exists: no existing PRs
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]*gogithub.PullRequest{})
+				return
+			}
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": "Validation Failed",
+				"errors":  []map[string]string{{"message": "some error"}},
+			})
+		}))
+		defer server.Close()
+
+		wbc := &WriteBackConfig{
+			GitRepo:    server.URL + "/org/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitHub,
+			GitClient:  &mockGitClient{},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "github-token"}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "could not create PR")
+	})
+
+	// --- GitLab API phase ---
+
+	t.Run("GitLab: MR created successfully", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				// exists: no existing MRs
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+				return
+			}
+			assert.Equal(t, http.MethodPost, r.Method)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"iid":     1,
+				"web_url": "http://example.com/-/merge_requests/1",
+			})
+		}))
+		defer server.Close()
+
+		wbc := &WriteBackConfig{
+			GitRepo:    server.URL + "/group/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitLab,
+			GitClient:  &mockGitClient{},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "gitlab-token"}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.NoError(t, err)
+	})
+
+	t.Run("GitLab: MR already exists — treated as no-op, no error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				// exists: an existing open MR
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]map[string]any{{"iid": 1}})
+				return
+			}
+			// create should not be reached because exists found an existing MR
+			t.Error("create should not be called when exists finds an existing MR")
+		}))
+		defer server.Close()
+
+		wbc := &WriteBackConfig{
+			GitRepo:    server.URL + "/group/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitLab,
+			GitClient:  &mockGitClient{},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "gitlab-token"}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.NoError(t, err)
+	})
+
+	t.Run("GitLab: create fails with 422", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				// exists: no existing MRs
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+				return
+			}
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": "some validation error",
+			})
+		}))
+		defer server.Close()
+
+		wbc := &WriteBackConfig{
+			GitRepo:    server.URL + "/group/repo.git",
+			GitBranch:  "main",
+			PRProvider: PRProviderGitLab,
+			GitClient:  &mockGitClient{},
+			GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+				return &mockGitAndSCMCreds{token: "gitlab-token"}, nil
+			},
+		}
+		_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "could not create MR")
+	})
+
+	// --- Azure DevOps API phase ---
+
+	for _, tt := range []struct {
+		name, body string
+		status     int
+		exists     bool
+		wantErrMsg string
+	}{
+		{"PR created successfully", `{"pullRequestId":42}`, http.StatusCreated, false, ""},
+		{"existing PR skips git", "", http.StatusOK, true, ""},
+		{"concurrent duplicate is a no-op", `{"typeKey":"GitPullRequestExistsException"}`, http.StatusConflict, false, ""},
+		{"create fails with 400", `{"message":"Invalid branch."}`, http.StatusBadRequest, false, "could not create PR"},
+	} {
+		t.Run("Azure DevOps: "+tt.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					if tt.exists {
+						_, _ = w.Write([]byte(`{"value":[{"pullRequestId":42}]}`))
+					} else {
+						_, _ = w.Write([]byte(`{"value":[]}`))
+					}
+					return
+				}
+				assert.Equal(t, http.MethodPost, r.Method)
+				if tt.exists {
+					t.Error("create should not be called when exists finds an existing PR")
+				}
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			// The Azure DevOps API client takes its root CAs from the Argo CD TLS
+			// certificate store, not from http.DefaultTransport.
+			trustServerViaCertStore(t, server)
+
+			gitClient := &mockGitClient{}
+			if tt.exists {
+				gitClient.initErr = fmt.Errorf("git must not be initialized when the PR exists")
+			}
+			wbc := &WriteBackConfig{
+				GitRepo:    server.URL + "/org/project/_git/repo",
+				GitBranch:  "main",
+				PRProvider: PRProviderAzureDevOps,
+				GitClient:  gitClient,
+				GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+					return &mockGitAndSCMCreds{token: "pat"}, nil
+				},
+			}
+			_, err := commitChangesPR(ctx, makeTestAppImages(wbc), nil, noopWriter)
+			if tt.wantErrMsg != "" {
+				require.ErrorContains(t, err, tt.wantErrMsg)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+
+	// --- Gitea API phase ---
+
+	for _, tt := range []struct {
+		name, body string
+		status     int
+		exists     bool
+		wantErrMsg string
+	}{
+		{"PR created successfully", `{"number":42}`, http.StatusCreated, false, ""},
+		{"existing PR skips git", "", http.StatusOK, true, ""},
+		{"concurrent duplicate is a no-op", `{"message":"pull request already exists for these targets"}`, http.StatusConflict, false, ""},
+		{"create fails with 422", `{"message":"Invalid PullRequest"}`, http.StatusUnprocessableEntity, false, "could not create PR"},
+	} {
+		t.Run("Gitea: "+tt.name, func(t *testing.T) {
+			var pushBranch string
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					if tt.exists && r.URL.Query().Get("page") == "1" {
+						_, _ = fmt.Fprintf(w, `[{"number":42,"head":{"ref":%q,"repo_id":1},"base":{"ref":"main","repo_id":1}}]`, pushBranch)
+					} else {
+						_, _ = w.Write([]byte(`[]`))
+					}
+					return
+				}
+				assert.Equal(t, http.MethodPost, r.Method)
+				if tt.exists {
+					t.Error("create should not be called when exists finds an existing PR")
+				}
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			// The Gitea API client takes its root CAs from the Argo CD TLS
+			// certificate store, not from http.DefaultTransport.
+			trustServerViaCertStore(t, server)
+
+			gitClient := &mockGitClient{}
+			if tt.exists {
+				gitClient.initErr = fmt.Errorf("git must not be initialized when the PR exists")
+			}
+			wbc := &WriteBackConfig{
+				GitRepo:    server.URL + "/owner/repo.git",
+				GitBranch:  "main",
+				PRProvider: PRProviderGitea,
+				GitClient:  gitClient,
+				GetCreds: func(_ *argocdapi.Application) (git.Creds, error) {
+					return &mockGitAndSCMCreds{token: "token"}, nil
+				},
+			}
+			appImages := makeTestAppImages(wbc)
+			pushBranch = TemplateBranchName(ctx, PRBranchTemplate, appImages.Application.Namespace, appImages.Application.Name, wbc.WriteBackTargetKey(), nil)
+			_, err := commitChangesPR(ctx, appImages, nil, noopWriter)
+			if tt.wantErrMsg != "" {
+				require.ErrorContains(t, err, tt.wantErrMsg)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

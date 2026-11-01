@@ -1,0 +1,1324 @@
+package argocd
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/exp/slices"
+	yaml "sigs.k8s.io/yaml/goyaml.v3"
+
+	iuapi "github.com/argoproj-labs/argocd-image-updater/api/v1alpha1"
+	"github.com/argoproj-labs/argocd-image-updater/ext/git"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/common"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/kube"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/image"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/log"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/registry"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/tag"
+
+	"github.com/argoproj/argo-cd/v3/pkg/apiclient/application"
+	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+)
+
+// listElementPattern is a regular expression for searching for an element in a yaml array.
+// example: any-string[1]
+const listElementPattern = `^(.*)\[(.*)\]$`
+
+var re = regexp.MustCompile(listElementPattern)
+
+// UpdateApplication update all images of a single application. Will run in a goroutine.
+func UpdateApplication(ctx context.Context, updateConf *UpdateConfiguration, state *SyncIterationState) ImageUpdaterResult {
+	baseLogger := log.LoggerFromContext(ctx)
+
+	var needUpdate bool = false
+	result := ImageUpdaterResult{}
+	app := updateConf.UpdateApp.Application.GetName()
+	appNs := updateConf.UpdateApp.Application.GetNamespace()
+
+	changeList := make([]ChangeEntry, 0)
+
+	// Get all images that are deployed with the current application
+	applicationImages := GetImagesFromApplication(updateConf.UpdateApp)
+
+	result.NumApplicationsProcessed += 1
+
+	// Loop through all images of current application, and check whether one of
+	// its images is eligible for updating.
+	//
+	// Whether an image qualifies for update is dependent on semantic version
+	// constraints which are part of the application's values.
+	//
+	for _, applicationImage := range updateConf.UpdateApp.Images {
+		// updateableImage is the live image found in the cluster status
+		updateableImage := applicationImages.ContainsImage(applicationImage.ContainerImage, false)
+		if updateableImage == nil {
+			baseLogger.Debugf("Image '%s' seems not to be live in this application, skipping", applicationImage.ImageName)
+			result.NumSkipped += 1
+			continue
+		}
+
+		// In some cases, the running image has no tag set. We create a dummy
+		// tag, without name, digest and a timestamp of zero. This dummy tag
+		// will trigger an update on the first run.
+		if updateableImage.ImageTag == nil {
+			updateableImage.ImageTag = tag.NewImageTag("", time.Unix(0, 0), "")
+		}
+
+		result.NumImagesConsidered += 1
+
+		fields := updateableImage.GetLogFields(applicationImage.ImageAlias)
+		imgCtx := baseLogger.WithFields(fields)
+		imageOpCtx := log.ContextWithLogger(ctx, imgCtx)
+
+		if updateableImage.KustomizeImage != nil {
+			imgCtx = imgCtx.WithField("kustomize_image", updateableImage.KustomizeImage)
+		}
+
+		imgCtx.Debugf("Considering this image for update")
+
+		rep, err := registry.GetRegistryEndpoint(imageOpCtx, applicationImage.ContainerImage)
+		if err != nil {
+			imgCtx.Errorf("Could not get registry endpoint from configuration: %v", err)
+			result.NumErrors += 1
+			continue
+		}
+
+		var vc image.VersionConstraint
+		if applicationImage.ImageTag != nil {
+			vc.Constraint = applicationImage.ImageTag.TagName
+			imgCtx.Debugf("Using version constraint '%s' when looking for a new tag", vc.Constraint)
+		} else {
+			imgCtx.Debugf("Using no version constraint when looking for a new tag")
+		}
+
+		vc.Strategy = applicationImage.UpdateStrategy
+		vc.MatchFunc, vc.MatchArgs = applicationImage.ParseMatch(imageOpCtx, applicationImage.AllowTags)
+		vc.IgnoreList = applicationImage.IgnoreTags
+		vc.Options = applicationImage.
+			GetPlatformOptions(imageOpCtx, updateConf.IgnorePlatforms, applicationImage.Platforms).
+			WithMetadata(vc.Strategy.NeedsMetadata())
+
+		// If a strategy needs meta-data and tagsortmode is set for the
+		// registry, let the user know.
+		if rep.TagListSort > registry.TagListSortUnsorted && vc.Strategy.NeedsMetadata() {
+			imgCtx.Infof("taglistsort is set to '%s' but update strategy '%s' requires metadata. Results may not be what you expect.", rep.TagListSort.String(), vc.Strategy.String())
+		}
+
+		// retrieves an image's pull secret credentials
+		secretVal := applicationImage.PullSecret
+		if secretVal == "" {
+			imgCtx.Tracef("No pull secret configured for this image")
+		}
+
+		// reject cross-namespace secret references in commonUpdateSettings.pullSecret
+		if strings.HasPrefix(secretVal, "pullsecret:") || strings.HasPrefix(secretVal, "secret:") {
+			// Strip "pullsecret:" or "secret:" prefix before splitting on "/" to isolate the namespace.
+			_, ref, _ := strings.Cut(secretVal, ":")
+			s := strings.SplitN(ref, "/", 2)
+			if len(s) == 2 {
+				if s[0] != appNs {
+					imgCtx.Errorf("commonUpdateSettings.pullSecret namespace '%s' differs from app namespace '%s'", s[0], appNs)
+					result.NumErrors += 1
+					continue
+				}
+			}
+		}
+
+		// The endpoint can provide default credentials for pulling images
+		creds, err := rep.SetEndpointCredentials(imageOpCtx, updateConf.KubeClient.KubeClient, secretVal)
+		if err != nil {
+			imgCtx.Errorf("Could not set registry endpoint credentials: %v", err)
+			result.NumErrors += 1
+			continue
+		}
+
+		regClient, err := updateConf.NewRegFN(rep, creds.Username, creds.Password)
+		if err != nil {
+			imgCtx.Errorf("Could not create registry client: %v", err)
+			result.NumErrors += 1
+			continue
+		}
+
+		// Get list of available image tags from the repository
+		// Load creds, create registry client, fetch tags (retry once on 401/403)
+		tags, err := rep.GetTags(imageOpCtx, applicationImage.ContainerImage, regClient, &vc, secretVal == "")
+		if err != nil {
+			// Retry once on 401/403
+			if errors.Is(err, registry.ErrCredentialsInvalid) {
+				imgCtx.Infof("credentials invalid (401/403), refetching and retrying once")
+				// The endpoint can provide default credentials for pulling images
+				creds, err = rep.SetEndpointCredentials(imageOpCtx, updateConf.KubeClient.KubeClient, secretVal)
+				if err != nil {
+					imgCtx.Errorf("Could not set registry endpoint credentials: %v", err)
+					result.NumErrors += 1
+					continue
+				}
+
+				regClient, err = updateConf.NewRegFN(rep, creds.Username, creds.Password)
+				if err != nil {
+					imgCtx.Errorf("Could not create registry client: %v", err)
+					result.NumErrors += 1
+					continue
+				}
+				tags, err = rep.GetTags(imageOpCtx, applicationImage.ContainerImage, regClient, &vc, secretVal == "")
+			}
+			if err != nil {
+				imgCtx.Errorf("Could not get tags from registry: %v", err)
+				result.NumErrors += 1
+				continue
+			}
+		}
+
+		imgCtx.Tracef("List of available tags found: %v", tags.Tags())
+
+		// Get the latest available tag matching any constraint that might be set
+		// for allowed updates.
+		latest, err := updateableImage.GetNewestVersionFromTags(imageOpCtx, &vc, tags)
+		if err != nil {
+			imgCtx.Errorf("Unable to find newest version from available tags: %v", err)
+			result.NumErrors += 1
+			continue
+		}
+
+		// If we have no latest tag information, it means there was no tag which
+		// has met our version constraint (or there was no semantic versioned tag
+		// at all in the repository)
+		if latest == nil {
+			imgCtx.Debugf("No suitable image tag for upgrade found in list of available tags.")
+			result.NumSkipped += 1
+			continue
+		}
+
+		// When several containers in the application reference the same image
+		// name, the live image list (Argo CD's alias-less, de-duplicated
+		// Status.Summary.Images) can cause the earlier ContainsImage lookup to
+		// resolve to a sibling container, hiding this image's pending update or
+		// triggering a spurious one. For digest strategy, re-select the live
+		// image that actually belongs to this alias (by tag, then by stale
+		// digest) so it is evaluated against its own container.
+		if vc.Strategy == image.StrategyDigest {
+			if m := applicationImages.MatchForDigestUpdate(applicationImage.ContainerImage, latest.TagDigest); m != nil && m != updateableImage {
+				imgCtx.Debugf("Multiple containers reference image '%s'; re-selected live image (tag '%s', digest '%s') for update evaluation", applicationImage.ImageName, m.ImageTag.TagName, m.ImageTag.TagDigest)
+				updateableImage = m
+			}
+		}
+
+		if needsUpdate(updateableImage, applicationImage.ContainerImage, latest, vc.Strategy) {
+			appImageWithTag := applicationImage.WithTag(latest)
+			appImageFullNameWithTag := appImageWithTag.GetFullNameWithTag()
+
+			// Check if new image is already set in Application Spec when write back is set to argocd
+			// and compare with new image
+			appImageSpec, err := getAppImage(imageOpCtx, &updateConf.UpdateApp.Application, updateConf.UpdateApp.WriteBackConfig, applicationImage)
+			if err != nil {
+				// Typically a per-image manifest target that does not match the
+				// application's type (e.g. manifestTargets.plugin on a Helm app).
+				// Report it - skipping quietly leaves the image permanently
+				// un-updated with no trace in the logs or the error count.
+				imgCtx.Errorf("Unable to read the current image from the application: %v", err)
+				result.NumErrors += 1
+				continue
+			}
+			if appImageSpec == appImageFullNameWithTag {
+				imgCtx.Infof("New image %s already set in spec", appImageFullNameWithTag)
+				continue
+			}
+
+			// check signature for appImageWithTag using applicationImage.Verify
+			if applicationImage.EnableVerification {
+				switch {
+				case applicationImage.Verify != nil && applicationImage.Verify.CosignKey != "":
+					err := image.VerifyWithPublicKey(imageOpCtx, appImageWithTag, applicationImage.Verify, regClient)
+					if err != nil {
+						imgCtx.Errorf("Unable to verify image %s with public key: %v", appImageFullNameWithTag, err)
+						result.NumErrors += 1
+						continue
+					}
+				// additional verification methods will be added here
+				default:
+					imgCtx.Errorf("Image verification enabled but no verification method configured for %s", appImageFullNameWithTag)
+					result.NumErrors += 1
+					continue
+				}
+			} else {
+				imgCtx.Debugf("Image verification not configured for %s, skipping", appImageFullNameWithTag)
+			}
+
+			needUpdate = true
+			imgCtx.Infof("Setting new image to %s", appImageFullNameWithTag)
+
+			err = setAppImage(imageOpCtx, &updateConf.UpdateApp.Application, appImageWithTag, updateConf.UpdateApp.WriteBackConfig, applicationImage)
+
+			if err != nil {
+				imgCtx.Errorf("Error while trying to update image: %v", err)
+				result.NumErrors += 1
+				continue
+			} else {
+				imgCtx.Infof("Successfully updated image '%s' to '%s', but pending spec update (dry run=%v)", updateableImage.GetFullNameWithTag(), appImageFullNameWithTag, updateConf.DryRun)
+				changeList = append(changeList, ChangeEntry{appImageWithTag, updateableImage.ImageTag, appImageWithTag.ImageTag})
+				result.NumImagesUpdated += 1
+			}
+		} else {
+			// We need to explicitly set the up-to-date images in the spec too, so
+			// that we correctly marshal out the parameter overrides to include all
+			// images, regardless of those were updated or not.
+			currentTag := updateableImage.ImageTag
+			// After a sync, Argo CD can record the running image in
+			// Status.Summary.Images as a bare digest with no tag name. For digest
+			// strategy, re-writing the image from that tag-less value drops the
+			// tracked tag name and degrades it to "latest@<digest>", corrupting the
+			// write-back and producing a commit every reconcile cycle. Preserve the
+			// alias's tracked tag name in that case.
+			if vc.Strategy == image.StrategyDigest && vc.Constraint != "" &&
+				(currentTag == nil || currentTag.TagName == "") {
+				digest := ""
+				if currentTag != nil {
+					digest = currentTag.TagDigest
+				}
+				currentTag = tag.NewImageTag(vc.Constraint, time.Unix(0, 0), digest)
+			}
+			err = setAppImage(imageOpCtx, &updateConf.UpdateApp.Application, applicationImage.WithTag(currentTag), updateConf.UpdateApp.WriteBackConfig, applicationImage)
+			if err != nil {
+				imgCtx.Errorf("Error while trying to update image: %v", err)
+				result.NumErrors += 1
+			}
+			imgCtx.Debugf("Image '%s' already on latest allowed version", updateableImage.GetFullNameWithTag())
+		}
+	}
+
+	wbc := updateConf.UpdateApp.WriteBackConfig
+	wbc.ArgoClient = updateConf.ArgoClient
+
+	if updateConf.GitCreds == nil {
+		wbc.GitCreds = git.NoopCredsStore{}
+	} else {
+		wbc.GitCreds = updateConf.GitCreds
+	}
+
+	if wbc.Method == WriteBackGit {
+		if updateConf.GitCommitUser != "" {
+			wbc.GitCommitUser = updateConf.GitCommitUser
+		}
+		if updateConf.GitCommitEmail != "" {
+			wbc.GitCommitEmail = updateConf.GitCommitEmail
+		}
+		if len(changeList) > 0 && updateConf.GitCommitMessage != nil {
+			wbc.GitCommitMessage = TemplateCommitMessage(ctx, updateConf.GitCommitMessage, updateConf.UpdateApp.Application.Name, changeList)
+		}
+		if updateConf.GitCommitSigningKey != "" {
+			wbc.GitCommitSigningKey = updateConf.GitCommitSigningKey
+		}
+		wbc.GitCommitSigningMethod = updateConf.GitCommitSigningMethod
+		wbc.GitCommitSignOff = updateConf.GitCommitSignOff
+		wbc.GitCommitMethod = updateConf.GitCommitMethod
+	}
+
+	if needUpdate {
+		baseLogger.Debugf("Using commit message: %s", wbc.GitCommitMessage)
+		if !updateConf.DryRun {
+			baseLogger.Infof("Committing %d parameter update(s) for application %s", result.NumImagesUpdated, app)
+			err := commitChangesLocked(ctx, updateConf.UpdateApp, state, changeList)
+			if err != nil {
+				baseLogger.Errorf("Could not update application spec: %v", err)
+				result.NumErrors += 1
+				result.NumImagesUpdated = 0
+			} else {
+				baseLogger.Infof("Successfully updated the live application spec")
+				if !updateConf.DisableKubeEvents && updateConf.KubeClient != nil {
+					annotations := map[string]string{}
+					for i, c := range changeList {
+						annotations[fmt.Sprintf("argocd-image-updater.image-%d/full-image-name", i)] = c.Image.GetFullNameWithoutTag()
+						annotations[fmt.Sprintf("argocd-image-updater.image-%d/image-name", i)] = c.Image.ImageName
+						annotations[fmt.Sprintf("argocd-image-updater.image-%d/old-tag", i)] = c.OldTag.String()
+						annotations[fmt.Sprintf("argocd-image-updater.image-%d/new-tag", i)] = c.NewTag.String()
+					}
+					message := fmt.Sprintf("Successfully updated application '%s'", app)
+					_, err = updateConf.KubeClient.CreateApplicationEvent(&updateConf.UpdateApp.Application, "ImagesUpdated", message, annotations)
+					if err != nil {
+						baseLogger.Warnf("Event could not be sent: %v", err)
+					}
+				} else {
+					if updateConf.DisableKubeEvents {
+						baseLogger.Debugf("Kubernetes events disabled for application '%s'", app)
+					}
+					if updateConf.KubeClient == nil {
+						baseLogger.Debugf("KubeClient is nil, skipping Kubernetes event creation for application '%s'", app)
+					}
+				}
+			}
+		} else {
+			baseLogger.Infof("Dry run - not committing %d changes to application", result.NumImagesUpdated)
+		}
+	}
+
+	result.Changes = changeList
+	return result
+}
+
+// needsUpdate determines if an image needs to be updated based on the provided
+// updateableImage, applicationImage, latest available tag, and update strategy.
+// It considers digest strategy, tag equality, and Kustomize image differences.
+// Returns true if an update is required, false otherwise.
+func needsUpdate(updateableImage *image.ContainerImage, applicationImage *image.ContainerImage, latest *tag.ImageTag, strategy image.UpdateStrategy) bool {
+	if strategy == image.StrategyDigest {
+		if updateableImage.ImageTag == nil {
+			return true
+		}
+		// When using digest strategy, consider the digest even if the current image
+		// was referenced by tag. If either digest is missing or differs, we want an update.
+		if !updateableImage.ImageTag.IsDigest() || updateableImage.ImageTag.TagDigest != latest.TagDigest {
+			return true
+		}
+	}
+	// If the latest tag does not match image's current tag or the kustomize image is different, it means we have an update candidate.
+	return !updateableImage.ImageTag.Equals(latest) || applicationImage.KustomizeImage != nil && applicationImage.DiffersFrom(updateableImage, false)
+}
+
+// getAppImage retrieves the current image string from an Argo CD application.
+// It determines the application type (Kustomize, Helm, or Plugin) and calls the
+// appropriate function to extract the image information.
+func getAppImage(ctx context.Context, app *v1alpha1.Application, wbc *WriteBackConfig, applicationImage *Image) (string, error) {
+	if applicationImage.PluginEnvName != "" || applicationImage.PluginEnvSpec != "" {
+		return GetPluginImage(ctx, app, wbc, applicationImage)
+	}
+	if appType := GetApplicationType(app, wbc); appType == ApplicationTypeKustomize {
+		return GetKustomizeImage(ctx, app, wbc, applicationImage)
+	} else if appType == ApplicationTypeHelm {
+		return GetHelmImage(ctx, app, wbc, applicationImage)
+	} else if appType == ApplicationTypePlugin {
+		return GetPluginImage(ctx, app, wbc, applicationImage)
+	} else {
+		return "", fmt.Errorf("could not update application %s - unsupported application type", app)
+	}
+}
+
+// setAppImage updates the image in the application's manifest based on its type (Kustomize, Helm, or Plugin).
+// It calls the appropriate function to perform the update.
+// Returns an error if the application type is unsupported, or if the update fails.
+func setAppImage(ctx context.Context, app *v1alpha1.Application, img *image.ContainerImage, wbc *WriteBackConfig, applicationImage *Image) error {
+	if applicationImage.PluginEnvName != "" || applicationImage.PluginEnvSpec != "" {
+		return SetPluginImage(ctx, app, img, wbc, applicationImage)
+	}
+	if appType := GetApplicationType(app, wbc); appType == ApplicationTypeKustomize {
+		return SetKustomizeImage(ctx, app, img, wbc, applicationImage)
+	} else if appType == ApplicationTypeHelm {
+		return SetHelmImage(ctx, app, img, wbc, applicationImage)
+	} else if appType == ApplicationTypePlugin {
+		return SetPluginImage(ctx, app, img, wbc, applicationImage)
+	} else {
+		return fmt.Errorf("could not update application %s - unsupported application type", app)
+	}
+}
+
+// marshalWithIndent marshals in to YAML with the given indent, optionally
+// prepending docStartPrefix verbatim. See leadingDocumentStartPrefix for why
+// callers track and pass that prefix through explicitly rather than relying
+// on the encoder to preserve it.
+func marshalWithIndent(in any, indent int, docStartPrefix []byte) (out []byte, err error) {
+	var b bytes.Buffer
+	encoder := yaml.NewEncoder(&b)
+	defer encoder.Close()
+	// note: yaml.v3 will only respect indents from 1 to 9 inclusive.
+	encoder.SetIndent(indent)
+	encoder.CompactSeqIndent()
+	if err = encoder.Encode(in); err != nil {
+		return nil, err
+	}
+	if err = encoder.Close(); err != nil {
+		return nil, err
+	}
+	out = b.Bytes()
+	if len(docStartPrefix) > 0 {
+		out = append(append([]byte{}, docStartPrefix...), out...)
+	}
+	return out, nil
+}
+
+// leadingDocumentStartPrefix returns raw's leading run of blank lines, "#"
+// comments, and "%YAML"/"%TAG" directives, together with the "---"
+// document-start marker that follows them, verbatim and including its
+// trailing newline - or nil if that leading run isn't followed by an
+// explicit document-start marker. Directives are only ever valid directly
+// before a document-start marker, so skipping them is required for
+// correctness, not just leniency. Write-back re-marshals the target file
+// through an Encoder that has no memory of the source's original formatting,
+// so callers use this to carry that whole prefix through the round-trip
+// verbatim, rather than always adding or always dropping it regardless of
+// what the file looked like before.
+func leadingDocumentStartPrefix(raw []byte) []byte {
+	lines := strings.Split(string(raw), "\n")
+	n := 0
+	for n < len(lines) {
+		trimmed := strings.TrimSpace(lines[n])
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "%") {
+			n++
+			continue
+		}
+		break
+	}
+	if n >= len(lines) {
+		return nil
+	}
+	// A document-start marker is only valid at column 0, so check the
+	// untrimmed line rather than trimmed - an indented "---" is ordinary
+	// scalar content, not a marker.
+	marker := lines[n]
+	if marker != "---" && !strings.HasPrefix(marker, "--- ") && !strings.HasPrefix(marker, "---\t") {
+		return nil
+	}
+	return []byte(strings.Join(lines[:n+1], "\n") + "\n")
+}
+
+// marshalParamsOverride marshals the parameter overrides of a given application
+// into YAML bytes
+func marshalParamsOverride(ctx context.Context, applicationImages *ApplicationImages, originalData []byte) ([]byte, error) {
+	log := log.LoggerFromContext(ctx)
+	var override []byte
+	var err error
+	app := &applicationImages.Application
+	wbc := applicationImages.WriteBackConfig
+	docStartPrefix := leadingDocumentStartPrefix(originalData)
+
+	appSource := GetApplicationSource(ctx, app, wbc)
+
+	if hasPluginTargets(applicationImages.Images) {
+		if appSource.Plugin == nil {
+			return []byte{}, nil
+		}
+
+		targetEnvNames := make(map[string]bool)
+		for _, img := range applicationImages.Images {
+			if img.PluginEnvSpec != "" {
+				targetEnvNames[img.PluginEnvSpec] = true
+			} else {
+				if img.PluginEnvName != "" {
+					targetEnvNames[img.PluginEnvName] = true
+				}
+				if img.PluginEnvTag != "" {
+					targetEnvNames[img.PluginEnvTag] = true
+				}
+			}
+		}
+
+		var filteredEnv []v1alpha1.EnvEntry
+		for _, e := range appSource.Plugin.Env {
+			if e != nil && targetEnvNames[e.Name] {
+				filteredEnv = append(filteredEnv, v1alpha1.EnvEntry{Name: e.Name, Value: e.Value})
+			}
+		}
+
+		newParams := pluginOverride{
+			Plugin: pluginEnvEntries{Env: filteredEnv},
+		}
+
+		if len(originalData) == 0 {
+			override, err = marshalWithIndent(newParams, defaultIndent, docStartPrefix)
+		} else {
+			var params pluginOverride
+			if unmarshalErr := yaml.Unmarshal(originalData, &params); unmarshalErr != nil {
+				override, err = marshalWithIndent(newParams, defaultIndent, docStartPrefix)
+			} else {
+				mergePluginOverride(&params, &newParams)
+				override, err = marshalWithIndent(params, defaultIndent, docStartPrefix)
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		return override, nil
+	}
+
+	appType := GetApplicationType(app, wbc)
+
+	switch appType {
+	case ApplicationTypeKustomize:
+		if appSource.Kustomize == nil {
+			return []byte{}, nil
+		}
+
+		var params kustomizeOverride
+		newParams := kustomizeOverride{
+			Kustomize: kustomizeImages{
+				Images: &appSource.Kustomize.Images,
+			},
+		}
+
+		if len(originalData) == 0 {
+			override, err = marshalWithIndent(newParams, defaultIndent, docStartPrefix)
+			break
+		}
+		err = yaml.Unmarshal(originalData, &params)
+		if err != nil {
+			override, err = marshalWithIndent(newParams, defaultIndent, docStartPrefix)
+			break
+		}
+		mergeKustomizeOverride(&params, &newParams)
+		override, err = marshalWithIndent(params, defaultIndent, docStartPrefix)
+	case ApplicationTypeHelm:
+		// Extract Helm parameters safely; Helm may be nil for SourceHydrator apps
+		// where the source type is auto-detected from files rather than set in the spec.
+		var helmParams []v1alpha1.HelmParameter
+		if appSource.Helm != nil {
+			helmParams = appSource.Helm.Parameters
+		}
+
+		if wbc != nil && !strings.HasPrefix(filepath.Base(wbc.Target), common.DefaultTargetFilePrefix) {
+			images := GetImagesAndAliasesFromApplication(applicationImages)
+
+			var helmNewValues yaml.Node
+			emptyOriginalData := isOnlyWhitespace(originalData)
+			if emptyOriginalData {
+				// allow non-exists target file
+				helmNewValues = yaml.Node{
+					Kind:        yaml.DocumentNode,
+					HeadComment: "auto generated by argocd image updater",
+					Content: []*yaml.Node{
+						{
+							Kind:    yaml.MappingNode,
+							Tag:     "!!map",
+							Content: []*yaml.Node{},
+							Style:   yaml.LiteralStyle,
+						},
+					},
+				}
+			} else {
+				helmNewValues = yaml.Node{}
+				err = yaml.Unmarshal(originalData, &helmNewValues)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			var writes []helmValueWrite
+			for _, c := range images {
+				if c == nil || c.ImageAlias == "" {
+					continue
+				}
+
+				// For image-spec, helmParamName holds the image-spec value and
+				// helmParamVersion is empty. Otherwise each of the two can be empty
+				// on its own, meaning the image does not track that half at all -
+				// then nothing is written for it.
+				helmParamName, helmParamVersion := getHelmParamNames(c)
+				if helmParamName == "" && helmParamVersion == "" {
+					return nil, fmt.Errorf("could not find an image-name or image-tag for image %s", c.ImageName)
+				}
+
+				if helmParamVersion != "" {
+					helmParamVer := getHelmParam(helmParams, helmParamVersion)
+					if helmParamVer == nil {
+						// Parameter not pre-defined in the Application - this image was
+						// skipped before setAppImage ran this cycle, so fall back to the
+						// image's own tag data, but only to seed a key the target file
+						// does not have yet. See keepExistingValue below.
+						if keepExistingValue(&helmNewValues, helmParamVersion) {
+							log.Debugf("helm parameter %s not found in app spec, keeping the value already in %s", helmParamVersion, wbc.Target)
+						} else if tagValue := c.ContainerImage.GetTagWithDigest(); tagValue != "" {
+							log.Debugf("helm parameter %s not found in app spec, using image tag as fallback", helmParamVersion)
+							writes = append(writes, helmValueWrite{kind: "version", path: helmParamVersion, value: tagValue})
+						}
+					} else if helmParamVer.Value != "" {
+						//Write tag in helm value file only if tag is not empty
+						writes = append(writes, helmValueWrite{kind: "version", path: helmParamVersion, value: helmParamVer.Value})
+					}
+				}
+
+				if helmParamName == "" {
+					continue
+				}
+
+				helmParamN := getHelmParam(helmParams, helmParamName)
+				// Determine which value to use for the image name parameter
+				var valueToSet string
+				if helmParamN == nil {
+					// Same as for the tag above - without a parameter from this cycle
+					// there is nothing new to say about this image.
+					if keepExistingValue(&helmNewValues, helmParamName) {
+						log.Debugf("helm parameter %s not found in app spec, keeping the value already in %s", helmParamName, wbc.Target)
+						continue
+					}
+					// Parameter not pre-defined in the Application - use the image's name data as fallback
+					log.Debugf("helm parameter %s not found in app spec, using image name as fallback", helmParamName)
+					if c.HelmImageSpec != "" {
+						// image-spec holds the whole reference, tag included
+						valueToSet = c.ContainerImage.GetFullNameWithTag()
+					} else {
+						valueToSet = c.ContainerImage.GetFullNameWithoutTag()
+					}
+				} else {
+					valueToSet = helmParamN.Value
+				}
+
+				if !emptyOriginalData && image.HasRegistryPrefix(valueToSet) {
+					// valueToSet is in long form (has registry URL)
+					// Check the original value in helmNewValues to see if it's in short form
+					// Skip this check if originalData is empty
+					originalValue, err := getHelmValue(&helmNewValues, helmParamName)
+					if err == nil {
+						// Original value exists and was found
+						if !image.HasRegistryPrefix(originalValue) {
+							// Original value is in short form, use the short form of the value to set
+							valueToSet = image.ExtractShortForm(valueToSet)
+						}
+						// If originalValue is also in long form, keep valueToSet as-is
+					}
+					// If getHelmValue returns an error (key not found), use valueToSet as-is
+				}
+				// If valueToSet is already in short form or originalData is empty, use it as-is
+
+				writes = append(writes, helmValueWrite{kind: "name", path: helmParamName, value: valueToSet})
+			}
+
+			override, err = applyHelmValueWrites(&helmNewValues, originalData, writes)
+		} else {
+			if appSource.Helm == nil {
+				return []byte{}, nil
+			}
+
+			// Only the Helm parameters that Image Updater actually manages (the
+			// image name/tag or image-spec parameter of each tracked image) may be
+			// written to the override file. appSource.Helm.Parameters reflects the
+			// live Application, which can also carry unrelated overrides (e.g. set
+			// manually via the Argo CD UI/API); those must not be persisted to git.
+			managedParamNames := make(map[string]bool)
+			for _, img := range applicationImages.Images {
+				helmParamName, helmParamVersion := getHelmParamNames(img)
+				if helmParamName != "" {
+					managedParamNames[helmParamName] = true
+				}
+				if helmParamVersion != "" {
+					managedParamNames[helmParamVersion] = true
+				}
+			}
+
+			managedParams := make([]v1alpha1.HelmParameter, 0, len(appSource.Helm.Parameters))
+			for _, p := range appSource.Helm.Parameters {
+				if managedParamNames[p.Name] {
+					managedParams = append(managedParams, p)
+				}
+			}
+
+			var params helmOverride
+			newParams := helmOverride{
+				Helm: helmParameters{
+					Parameters: managedParams,
+				},
+			}
+
+			outputParams := appSource.Helm.ValuesYAML()
+			log.Debugf("values: '%s'", outputParams)
+
+			if len(originalData) == 0 {
+				sortHelmParameters(newParams.Helm.Parameters)
+				override, err = marshalWithIndent(newParams, defaultIndent, docStartPrefix)
+				break
+			}
+			err = yaml.Unmarshal(originalData, &params)
+			if err != nil {
+				sortHelmParameters(newParams.Helm.Parameters)
+				override, err = marshalWithIndent(newParams, defaultIndent, docStartPrefix)
+				break
+			}
+			mergeHelmOverride(&params, &newParams)
+			sortHelmParameters(params.Helm.Parameters)
+			override, err = marshalWithIndent(params, defaultIndent, docStartPrefix)
+		}
+	default:
+		err = fmt.Errorf("unsupported application type")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return override, nil
+}
+
+func sortHelmParameters(params []v1alpha1.HelmParameter) {
+	slices.SortFunc(params, func(a, b v1alpha1.HelmParameter) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+}
+
+func mergeHelmOverride(t *helmOverride, o *helmOverride) {
+	for _, param := range o.Helm.Parameters {
+		idx := slices.IndexFunc(t.Helm.Parameters, func(tp v1alpha1.HelmParameter) bool { return tp.Name == param.Name })
+		if idx != -1 {
+			t.Helm.Parameters[idx] = param
+			continue
+		}
+		t.Helm.Parameters = append(t.Helm.Parameters, param)
+	}
+}
+
+func mergePluginOverride(target *pluginOverride, source *pluginOverride) {
+	for _, newEntry := range source.Plugin.Env {
+		found := false
+		for i, existing := range target.Plugin.Env {
+			if existing.Name == newEntry.Name {
+				target.Plugin.Env[i] = newEntry
+				found = true
+				break
+			}
+		}
+		if !found {
+			target.Plugin.Env = append(target.Plugin.Env, newEntry)
+		}
+	}
+}
+
+func mergeKustomizeOverride(t *kustomizeOverride, o *kustomizeOverride) {
+	if o.Kustomize.Images == nil {
+		return
+	}
+	if t.Kustomize.Images == nil {
+		emptyImages := make(v1alpha1.KustomizeImages, 0)
+		t.Kustomize.Images = &emptyImages
+	}
+	for _, newImage := range *o.Kustomize.Images {
+		found := false
+		newContainerImage := image.NewFromIdentifier(string(newImage))
+		for idx, existingImage := range *t.Kustomize.Images {
+			existingContainerImage := image.NewFromIdentifier(string(existingImage))
+			if sameImageNameAndRegistry(newContainerImage, existingContainerImage) {
+				found = true
+				if existingContainerImage.ImageTag == nil ||
+					(newContainerImage.ImageTag != nil && !(existingContainerImage.ImageTag).Equals(newContainerImage.ImageTag)) {
+					(*t.Kustomize.Images)[idx] = newImage
+				}
+				break
+			}
+		}
+		if !found {
+			*t.Kustomize.Images = append(*t.Kustomize.Images, newImage)
+		}
+	}
+}
+
+// sameImageNameAndRegistry checks if 2 ContainerImage have the same image name and registry url.
+// When comparing registry url, the default registry url "docker.io" and empty string are considered the same.
+func sameImageNameAndRegistry(img1 *image.ContainerImage, img2 *image.ContainerImage) bool {
+	if img1.ImageName != img2.ImageName {
+		return false
+	}
+	if img1.RegistryURL == img2.RegistryURL {
+		return true
+	}
+	if img1.RegistryURL == "" && img2.RegistryURL == "docker.io" {
+		return true
+	}
+	if img2.RegistryURL == "" && img1.RegistryURL == "docker.io" {
+		return true
+	}
+	return false
+}
+
+// Check if a key exists in a MappingNode and return the index of its value
+func findHelmValuesKey(m *yaml.Node, key string) (int, bool) {
+	for i, item := range m.Content {
+		if i%2 == 0 && item.Value == key {
+			return i + 1, true
+		}
+	}
+	return -1, false
+}
+
+func nodeKindString(k yaml.Kind) string {
+	return map[yaml.Kind]string{
+		yaml.DocumentNode: "DocumentNode",
+		yaml.SequenceNode: "SequenceNode",
+		yaml.MappingNode:  "MappingNode",
+		yaml.ScalarNode:   "ScalarNode",
+		yaml.AliasNode:    "AliasNode",
+	}[k]
+}
+
+// setHelmValue sets value of the parameter passed from the CRD configuration.
+func setHelmValue(currentValues *yaml.Node, key string, value any) error {
+	current := currentValues
+
+	// an unmarshalled document has a DocumentNode at the root, but
+	// we navigate from a MappingNode.
+	if current.Kind == yaml.DocumentNode {
+		current = current.Content[0]
+	}
+
+	if current.Kind != yaml.MappingNode {
+		return fmt.Errorf("unexpected type %s for root", nodeKindString(current.Kind))
+	}
+
+	// Check if the full key exists
+	if idx, found := findHelmValuesKey(current, key); found {
+		(*current).Content[idx].Value = value.(string)
+		return nil
+	}
+
+	var err error
+	keys := strings.Split(key, ".")
+	for i, k := range keys {
+		// pointer is needed to determine that the id has indeed been passed.
+		var idPtr *int
+		// by default, the search is based on the key without changes, but
+		// if string matches pattern, we consider it is an id in YAML list.
+		key := k
+		matches := re.FindStringSubmatch(k)
+		if matches != nil {
+			idStr := matches[2]
+			id, err := strconv.Atoi(idStr)
+			if err != nil {
+				return fmt.Errorf("id \"%s\" in yaml array must match pattern ^(.*)\\[(.*)\\]$", idStr)
+			}
+			idPtr = &id
+			key = matches[1]
+		}
+		if idx, found := findHelmValuesKey(current, key); found {
+			// Navigate deeper into the map
+			current = (*current).Content[idx]
+			// unpack one level of alias; an alias of an alias is not supported
+			if current.Kind == yaml.AliasNode {
+				current = current.Alias
+			}
+			if current.Kind != yaml.SequenceNode && idPtr != nil {
+				return fmt.Errorf("id %d provided when \"%s\" is not an yaml array", *idPtr, key)
+			}
+			if current.Kind == yaml.SequenceNode {
+				if idPtr == nil {
+					return fmt.Errorf("no id provided for yaml array \"%s\"", key)
+				}
+				currentContent := (*current).Content
+				if *idPtr < 0 || *idPtr >= len(currentContent) {
+					return fmt.Errorf("id %d is out of range [0, %d)", *idPtr, len(currentContent))
+				}
+				current = (*current).Content[*idPtr]
+			}
+			if i == len(keys)-1 {
+				// If we're at the final key, set the value and return
+				if current.Kind == yaml.ScalarNode {
+					current.Value = value.(string)
+					current.Tag = "!!str"
+				} else {
+					return fmt.Errorf("unexpected type %s for key %s", nodeKindString(current.Kind), k)
+				}
+				return nil
+			} else if current.Kind != yaml.MappingNode {
+				return fmt.Errorf("unexpected type %s for key %s", nodeKindString(current.Kind), k)
+			}
+		} else {
+			if i == len(keys)-1 {
+				current.Content = append(current.Content,
+					&yaml.Node{
+						Kind:  yaml.ScalarNode,
+						Value: k,
+						Tag:   "!!str",
+					},
+					&yaml.Node{
+						Kind:  yaml.ScalarNode,
+						Value: value.(string),
+						Tag:   "!!str",
+					},
+				)
+				return nil
+			} else {
+				current.Content = append(current.Content,
+					&yaml.Node{
+						Kind:  yaml.ScalarNode,
+						Value: k,
+						Tag:   "!!str",
+					},
+					&yaml.Node{
+						Kind:    yaml.MappingNode,
+						Content: []*yaml.Node{},
+					},
+				)
+				current = current.Content[len(current.Content)-1]
+			}
+		}
+	}
+
+	return err
+}
+
+// keepExistingValue reports whether key already holds a value in the target
+// file and must therefore be left alone.
+//
+// It guards the fallback path taken when an image has no Helm parameter from
+// this cycle. That happens when the image was skipped before setAppImage ran -
+// a registry error, no tag matching the constraint, a failed signature check -
+// while another image still triggered a write-back. The updater then knows
+// nothing new about this image, so rewriting its keys from the live cluster
+// state can only do damage: it reintroduces the registry prefix on a value the
+// file keeps in short form, drops the tag from an image-spec key, or reverts a
+// tag that is already committed but not yet rolled out. The fallback is only
+// there to seed a key that does not exist yet.
+func keepExistingValue(values *yaml.Node, key string) bool {
+	_, err := resolveHelmScalarNode(values, key)
+	return err == nil
+}
+
+// getHelmValue retrieves a value from a yaml.Node using a key path.
+// See resolveHelmScalarNode for how the key is interpreted.
+func getHelmValue(values *yaml.Node, key string) (string, error) {
+	node, err := resolveHelmScalarNode(values, key)
+	if err != nil {
+		return "", err
+	}
+	return node.Value, nil
+}
+
+// resolveHelmScalarNode resolves a key path to its scalar yaml.Node. The key
+// can be in the form of "a.b.c" which can be:
+// 1. A nested hierarchy where "a" has "b" which has "c"
+// 2. A literal key "a.b.c" if the nested structure doesn't exist
+// Returning the node (rather than just its value) lets callers read its source
+// Line/Column for in-place patching. Returns an error if the key is not found.
+func resolveHelmScalarNode(values *yaml.Node, key string) (*yaml.Node, error) {
+	current := values
+
+	// an unmarshalled document has a DocumentNode at the root, but
+	// we navigate from a MappingNode.
+	if current.Kind == yaml.DocumentNode {
+		if len(current.Content) == 0 {
+			return nil, fmt.Errorf("empty document node")
+		}
+		current = current.Content[0]
+	}
+
+	if current.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("unexpected type %s for root", nodeKindString(current.Kind))
+	}
+
+	// First, try to navigate as nested path (a.b.c)
+	keys := strings.Split(key, ".")
+	node := current
+
+	for i, k := range keys {
+		var idPtr *int
+		// Handle array indexing pattern like "key[0]"
+		keyPart := k
+		if matches := re.FindStringSubmatch(k); matches != nil {
+			id, err := strconv.Atoi(matches[2])
+			if err != nil {
+				return nil, fmt.Errorf("id \"%s\" in yaml array must match pattern ^(.*)\\[(.*)\\]$", matches[2])
+			}
+			idPtr = &id
+			keyPart = matches[1]
+		}
+
+		idx, found := findHelmValuesKey(node, keyPart)
+		if !found {
+			break // fall through to literal check
+		}
+		node = node.Content[idx]
+		// unpack one level of alias; an alias of an alias is not supported
+		if node.Kind == yaml.AliasNode {
+			node = node.Alias
+		}
+		if idPtr != nil {
+			// an index was requested, so the node must be a sequence; otherwise
+			// bail so the caller falls back rather than silently ignoring it
+			if node.Kind != yaml.SequenceNode || *idPtr < 0 || *idPtr >= len(node.Content) {
+				break
+			}
+			node = node.Content[*idPtr]
+		} else if node.Kind == yaml.SequenceNode {
+			break // can't navigate into a sequence without an index
+		}
+
+		if i == len(keys)-1 {
+			if node.Kind == yaml.ScalarNode {
+				return node, nil
+			}
+			break // not a scalar, fall through to literal check
+		} else if node.Kind != yaml.MappingNode {
+			break // can't navigate further
+		}
+	}
+
+	// If nested path didn't work, try as a literal key "a.b.c"
+	if idx, found := findHelmValuesKey(current, key); found {
+		valueNode := current.Content[idx]
+		if valueNode.Kind == yaml.AliasNode {
+			valueNode = valueNode.Alias
+		}
+		if valueNode.Kind == yaml.ScalarNode {
+			return valueNode, nil
+		}
+		return nil, fmt.Errorf("literal key \"%s\" found but is not a scalar value", key)
+	}
+
+	return nil, fmt.Errorf("key \"%s\" not found as nested path or literal key", key)
+}
+
+// helmValueWrite is a single parameter value to write into a Helm values
+// document. kind ("name" or "version") is used only for error context.
+type helmValueWrite struct {
+	kind  string
+	path  string
+	value string
+}
+
+// applyHelmValueWrites writes the given parameter values into a Helm values
+// document. When every write updates a value that already exists in the
+// original file as a plain scalar, it patches those values in place, preserving
+// the file's exact formatting (comments, blank lines, indentation, anchors,
+// inline-comment alignment). If any key must be created or cannot be safely
+// rewritten, it falls back to mutating the YAML node tree and re-marshalling,
+// which preserves comments and key order but not blank lines.
+func applyHelmValueWrites(root *yaml.Node, originalData []byte, writes []helmValueWrite) ([]byte, error) {
+	if patched, ok := patchHelmValuesInPlace(root, originalData, writes); ok {
+		return patched, nil
+	}
+	for _, w := range writes {
+		if err := setHelmValue(root, w.path, w.value); err != nil {
+			return nil, fmt.Errorf("failed to set image parameter %s value: %v", w.kind, err)
+		}
+	}
+	return marshalWithIndent(root, defaultIndent, leadingDocumentStartPrefix(originalData))
+}
+
+// patchHelmValuesInPlace edits value text directly in originalData. It succeeds
+// only when every write targets an existing plain scalar that can be safely
+// rewritten; otherwise it returns (nil, false) so the caller falls back to
+// re-marshalling. Because it never re-serialises untouched lines, all original
+// formatting outside the changed values is preserved byte-for-byte.
+func patchHelmValuesInPlace(root *yaml.Node, originalData []byte, writes []helmValueWrite) ([]byte, bool) {
+	if isOnlyWhitespace(originalData) {
+		return nil, false
+	}
+	type patch struct {
+		node  *yaml.Node
+		value string
+	}
+	patches := make([]patch, 0, len(writes))
+	for _, w := range writes {
+		node, err := resolveHelmScalarNode(root, w.path)
+		if err != nil {
+			return nil, false // key must be created -> fall back
+		}
+		patches = append(patches, patch{node: node, value: w.value})
+	}
+	lines := strings.Split(string(originalData), "\n")
+	for _, p := range patches {
+		if !patchScalarValue(lines, p.node, p.value) {
+			return nil, false // value not safely rewritable -> fall back
+		}
+	}
+	return []byte(strings.Join(lines, "\n")), true
+}
+
+// patchScalarValue replaces the value text of a scalar node at its recorded
+// Line/Column in lines, leaving the remainder of the line (trailing comments
+// and their alignment) untouched. It returns false when the raw text at that
+// position does not match the node's decoded value (e.g. quoted or block
+// scalars) or when the replacement would not be a safe plain scalar.
+func patchScalarValue(lines []string, node *yaml.Node, newValue string) bool {
+	if node == nil || node.Line < 1 || node.Line > len(lines) {
+		return false
+	}
+	line := lines[node.Line-1]
+	col := node.Column - 1
+	if col < 0 || col > len(line) {
+		return false
+	}
+	old := node.Value
+	if old == "" || !strings.HasPrefix(line[col:], old) {
+		return false
+	}
+	if !isSafePlainScalar(newValue) {
+		return false
+	}
+	lines[node.Line-1] = line[:col] + newValue + line[col+len(old):]
+	return true
+}
+
+// isSafePlainScalar reports whether s can be written as an unquoted YAML plain
+// scalar without changing tokenisation or its resolved type. Conservative:
+// anything that could need quoting returns false, causing a fall back to
+// re-marshalling.
+func isSafePlainScalar(s string) bool {
+	if s == "" || strings.ContainsAny(s, "\n\t") {
+		return false
+	}
+	if strings.Contains(s, ": ") || strings.Contains(s, " #") {
+		return false
+	}
+	if strings.HasPrefix(s, " ") || strings.HasSuffix(s, " ") || strings.HasSuffix(s, ":") {
+		return false
+	}
+	switch s[0] {
+	case '!', '&', '*', '?', '|', '>', '%', '@', '`', '"', '\'', '#', ',', '[', ']', '{', '}', '-':
+		return false
+	}
+	// Reject values a YAML parser resolves as a non-string (int, float, bool,
+	// null): written unquoted, an image tag like "1.20" or "true" would
+	// round-trip as a float/bool instead of a string.
+	var v any
+	if err := yaml.Unmarshal([]byte(s), &v); err != nil {
+		return false
+	}
+	if _, ok := v.(string); !ok {
+		return false
+	}
+	// goyaml.v3 follows the YAML 1.2 core schema, so it decodes these as
+	// strings, but 1.1 consumers (e.g. Helm) treat them as booleans/null.
+	switch strings.ToLower(s) {
+	case "yes", "no", "on", "off", "y", "n", "null", "~":
+		return false
+	}
+	return true
+}
+
+func parseDefaultTarget(appNamespace string, appName string, path string, kubeClient *kube.ImageUpdaterKubernetesClient) string {
+	// when running from command line and argocd-namespace is not set, e.g., via --argocd-namespace option,
+	// kubeClient.Namespace may be resolved to "default". In this case, also use the file name without namespace
+	if appNamespace == kubeClient.KubeClient.Namespace || kubeClient.KubeClient.Namespace == "default" || appNamespace == "" {
+		defaultTargetFile := fmt.Sprintf(common.DefaultTargetFilePatternWithoutNamespace, appName)
+		return filepath.Join(path, defaultTargetFile)
+	} else {
+		defaultTargetFile := fmt.Sprintf(common.DefaultTargetFilePattern, appNamespace, appName)
+		return filepath.Join(path, defaultTargetFile)
+	}
+}
+
+func parseKustomizeBase(target string, sourcePath string) (kustomizeBase string) {
+	if target == common.KustomizationPrefix {
+		return filepath.Join(sourcePath, ".")
+	} else if base := target[len(common.KustomizationPrefix)+1:]; strings.HasPrefix(base, "/") {
+		return base[1:]
+	} else {
+		return filepath.Join(sourcePath, base)
+	}
+}
+
+// parseTarget extracts the target path to set in the writeBackConfig configuration
+func parseTarget(writeBackTarget string, sourcePath string) string {
+	if writeBackTarget == common.HelmPrefix {
+		return filepath.Join(sourcePath, "./", common.DefaultHelmValuesFilename)
+	} else if base := writeBackTarget[len(common.HelmPrefix)+1:]; strings.HasPrefix(base, "/") {
+		return base[1:]
+	} else {
+		return filepath.Join(sourcePath, base)
+	}
+}
+
+func parseGitConfig(ctx context.Context, app *v1alpha1.Application, kubeClient *kube.ImageUpdaterKubernetesClient, settings *iuapi.WriteBackConfig, wbc *WriteBackConfig, creds string) error {
+	if settings.GitConfig != nil && settings.GitConfig.Branch != nil {
+		branch := *settings.GitConfig.Branch
+
+		branches := strings.Split(strings.TrimSpace(branch), ":")
+		if len(branches) > 2 {
+			return fmt.Errorf("invalid format for git-branch: %v", branch)
+		}
+		wbc.GitBranch = branches[0]
+		if len(branches) == 2 {
+			wbc.GitWriteBranch = branches[1]
+		}
+
+	}
+	wbc.GitRepo = getApplicationSource(ctx, app, wbc).RepoURL
+	if settings.GitConfig != nil && settings.GitConfig.Repository != nil {
+		repo := *settings.GitConfig.Repository
+		wbc.GitRepo = repo
+	}
+	credsSource, err := getGitCredsSource(ctx, creds, kubeClient, wbc, app.GetNamespace())
+	if err != nil {
+		return fmt.Errorf("invalid git credentials source: %v", err)
+	}
+	wbc.GetCreds = credsSource
+	return nil
+}
+
+func commitChangesLocked(ctx context.Context, applicationImages *ApplicationImages, state *SyncIterationState, changeList []ChangeEntry) error {
+	logCtx := log.LoggerFromContext(ctx)
+	wbc := applicationImages.WriteBackConfig
+	if wbc.RequiresLocking() {
+		lock := state.GetRepositoryLock(wbc.GitRepo)
+		lock.Lock()
+		defer lock.Unlock()
+	}
+
+	var targetKey string
+	var reserved bool
+	if wbc.PRProvider > 0 {
+		targetKey = wbc.WriteBackTargetKey()
+		if !state.MarkPRCreated(targetKey) {
+			logCtx.Infof("Skipping PR creation: another application already created a PR for the same write-back target in this cycle")
+			return nil
+		}
+		reserved = true
+	}
+
+	nothingPushed, err := commitChanges(ctx, applicationImages, changeList)
+	if reserved && err == nil && nothingPushed {
+		// Nothing reached the remote for this target, so no PR/MR exists for
+		// it. Release the reservation so that another application sharing the
+		// same write-back target can still write back in this cycle. The
+		// reservation is kept on every other path, including errors, since
+		// the head branch may already have been pushed.
+		state.ReleasePRReservation(targetKey)
+	}
+	return err
+}
+
+// commitChanges commits any changes required for updating one or more images
+// after the UpdateApplication cycle has finished. For git write-back, the
+// returned bool reports whether nothing was pushed to the remote (see
+// commitChangesGit).
+func commitChanges(ctx context.Context, applicationImages *ApplicationImages, changeList []ChangeEntry) (bool, error) {
+	app := applicationImages.Application
+	wbc := applicationImages.WriteBackConfig
+	if wbc == nil {
+		return false, fmt.Errorf("write back method is not defined")
+	}
+	switch wbc.Method {
+	case WriteBackApplication:
+		_, err := wbc.ArgoClient.UpdateSpec(ctx, &application.ApplicationUpdateSpecRequest{
+			Name:         &app.Name,
+			AppNamespace: &app.Namespace,
+			Spec:         &app.Spec,
+		})
+		if err != nil {
+			return false, err
+		}
+	case WriteBackGit:
+		if wbc.PRProvider > 0 {
+			// create a Pull Request if provider was set
+			// if the kustomize base is set, the target is a kustomization
+			if wbc.KustomizeBase != "" {
+				return commitChangesPR(ctx, applicationImages, changeList, writeKustomization)
+			}
+			return commitChangesPR(ctx, applicationImages, changeList, writeOverrides)
+		}
+		// if the kustomize base is set, the target is a kustomization
+		if wbc.KustomizeBase != "" {
+			return commitChangesGit(ctx, applicationImages, changeList, writeKustomization)
+		}
+		return commitChangesGit(ctx, applicationImages, changeList, writeOverrides)
+	default:
+		return false, fmt.Errorf("unknown write back method set: %d", wbc.Method)
+	}
+	return false, nil
+}
+
+func isOnlyWhitespace(data []byte) bool {
+	if len(data) == 0 {
+		return true
+	}
+	for i := 0; i < len(data); {
+		r, size := utf8.DecodeRune(data[i:])
+		if !unicode.IsSpace(r) {
+			return false
+		}
+		i += size
+	}
+	return true
+}

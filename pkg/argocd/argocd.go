@@ -1,0 +1,1470 @@
+package argocd
+
+import (
+	"cmp"
+	"context"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+
+	"github.com/argoproj/argo-cd/v3/pkg/apiclient/application"
+	argocdapi "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/v3/util/db"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/sirupsen/logrus"
+
+	iuapi "github.com/argoproj-labs/argocd-image-updater/api/v1alpha1"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/common"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/kube"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/image"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/log"
+)
+
+// ArgoCDK8sClient is a controller-runtime based client specifically for ArgoCD application operations.
+// It wraps ctrlclient.Client to provide ArgoCD-specific functionality like getting, listing,
+// and updating ArgoCD Application resources.
+type ArgoCDK8sClient struct {
+	ctrlclient.Client
+}
+
+// NewArgoCDK8sClient creates a new ArgoCD-specific Kubernetes client for managing ArgoCD applications.
+// This client is designed to work with controller-runtime and provides methods for
+// ArgoCD Application CRUD operations.
+func NewArgoCDK8sClient(ctrlClient ctrlclient.Client) (*ArgoCDK8sClient, error) {
+	return &ArgoCDK8sClient{ctrlClient}, nil
+}
+
+// ArgoCD is the interface for accessing Argo CD functions we need
+//
+//go:generate mockery --name ArgoCD --output ./mocks --outpkg mocks
+type ArgoCD interface {
+	GetApplication(ctx context.Context, appNamespace string, appName string) (*argocdapi.Application, error)
+	UpdateSpec(ctx context.Context, spec *application.ApplicationUpdateSpecRequest) (*argocdapi.ApplicationSpec, error)
+}
+
+// GetApplication retrieves a single application by its name and namespace.
+func (client *ArgoCDK8sClient) GetApplication(ctx context.Context, appNamespace string, appName string) (*argocdapi.Application, error) {
+	app := &argocdapi.Application{}
+
+	if err := client.Get(ctx, types.NamespacedName{Namespace: appNamespace, Name: appName}, app); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// UpdateSpec updates the spec for given application
+func (client *ArgoCDK8sClient) UpdateSpec(ctx context.Context, spec *application.ApplicationUpdateSpecRequest) (*argocdapi.ApplicationSpec, error) {
+	log := log.LoggerFromContext(ctx)
+	app := &argocdapi.Application{}
+	var err error
+
+	// Use RetryOnConflict to handle potential conflicts gracefully.
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Get the latest version of the Application within the retry loop.
+		app, err = client.GetApplication(ctx, spec.GetAppNamespace(), spec.GetName())
+		if err != nil {
+			log.Errorf("could not get application: %s, error: %v", spec.GetName(), err)
+			return err
+		}
+
+		app.Spec = *spec.Spec
+
+		// Attempt to update the object. If there is a conflict,
+		// RetryOnConflict will automatically re-fetch and re-apply the changes.
+		return client.Update(ctx, app)
+	})
+
+	if err != nil {
+		log.Errorf("could not update application spec for %s: %v", spec.GetName(), err)
+		return nil, fmt.Errorf("failed to update application spec for %s after retries: %w", spec.GetName(), err)
+	}
+
+	log.Infof("Successfully updated application spec for %s", spec.GetName())
+	return &app.Spec, nil
+}
+
+// nameMatchesPatterns Matches a name against a list of patterns
+func nameMatchesPatterns(ctx context.Context, name string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	for _, p := range patterns {
+		if m, _ := nameMatchesPattern(ctx, name, p); m {
+			return true
+		}
+	}
+	return false
+}
+
+// nameMatchesPattern Matches a name against a pattern
+func nameMatchesPattern(ctx context.Context, name string, pattern string) (bool, error) {
+	log := log.LoggerFromContext(ctx)
+	log.Tracef("Matching application name %s against pattern %s", name, pattern)
+
+	m, err := filepath.Match(pattern, name)
+	if err != nil {
+		log.Warnf("Invalid application name pattern '%s': %v", pattern, err)
+		return false, fmt.Errorf("could not compile name pattern '%s': %w", pattern, err)
+	}
+	log.Tracef("Matched application name %s against pattern %s: %v", name, pattern, m)
+	return m, nil
+}
+
+// nameMatchesLabels checks if the given labels match the provided LabelSelector.
+// It returns true if the selectors are nil (no filtering), or if all MatchLabels
+// and MatchExpressions conditions are met.
+func nameMatchesLabels(ctx context.Context, appLabels map[string]string, selectors *metav1.LabelSelector) bool {
+	log := log.LoggerFromContext(ctx)
+	if selectors == nil {
+		return true // No selectors means no filtering by labels
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(selectors)
+	if err != nil {
+		// An invalid selector should not match anything.
+		log.Warnf("Invalid label selector provided: %v", err)
+		return false
+	}
+
+	result := selector.Matches(labels.Set(appLabels))
+	log.Tracef("Matched labels %v against selector %v: %v", appLabels, selectors, result)
+	return result
+}
+
+// processApplicationForUpdate checks if an application is of a supported type,
+// and if so, creates an ApplicationImages struct and adds it to the update map.
+func processApplicationForUpdate(ctx context.Context, kubeClient *kube.ImageUpdaterKubernetesClient, app *argocdapi.Application, appRef iuapi.ApplicationRef, appCommonUpdateSettings *iuapi.CommonUpdateSettings, appImagesVerification *iuapi.ImagesVerification, appWBCSettings *WriteBackConfig, appNSName string, appsForUpdate map[string]ApplicationImages, webhookEvent *WebhookEvent) {
+	log := log.LoggerFromContext(ctx)
+	sourceType := getApplicationSourceType(app, appWBCSettings)
+
+	// Check for valid application type
+	if !IsValidApplicationType(app, appWBCSettings) {
+		log.Warnf("skipping app '%s' of type '%s' because it's not of supported source type", appNSName, sourceType)
+		return
+	}
+	log.Tracef("processing app '%s' of type '%v'", appNSName, sourceType)
+
+	imageList := parseImageList(ctx, kubeClient, app.GetNamespace(), appRef.Images, appCommonUpdateSettings, appImagesVerification, webhookEvent)
+
+	if imageList == nil || len(*imageList) == 0 {
+		return
+	}
+
+	appImages := ApplicationImages{
+		Application:     *app,
+		WriteBackConfig: appWBCSettings,
+		Images:          *imageList,
+	}
+	appsForUpdate[appNSName] = appImages
+}
+
+// stripBracketsRegex is used to remove character set wildcards like [a-z]
+// from a pattern before calculating the number of literal characters for specificity.
+// It is compiled once at the package level for performance.
+var stripBracketsRegex = regexp.MustCompile(`\[.*?]`)
+
+// calculateSpecificity computes a numerical score for an ApplicationRef to determine
+// its precedence. A higher score means higher specificity.
+func calculateSpecificity(applicationRef iuapi.ApplicationRef) int {
+	score := 0
+	pattern := applicationRef.NamePattern
+
+	// 1. Check for an exact name match (highest precedence).
+	// We define an exact match as not containing any glob wildcards.
+	if !strings.ContainsAny(pattern, "*?[]") {
+		score += 1_000_000
+	}
+
+	// 2. Add points for the number of literal characters in the pattern.
+	// This makes "app-prod-*" more specific than "app-*".
+
+	// First, remove character set wildcards like [a-z] entirely.
+	patternWithoutSets := stripBracketsRegex.ReplaceAllString(pattern, "")
+
+	// Then, remove the other wildcards and count the length of what's left.
+	literals := strings.NewReplacer("*", "", "?", "").Replace(patternWithoutSets)
+	score += len(literals)
+
+	// 3. Add a significant bonus if a label selector is present.
+	if applicationRef.LabelSelectors != nil {
+		score += 10_000
+
+		// 4. Add smaller points for each label/expression in the selector.
+		// This makes a more complex selector win over a simpler one.
+		if applicationRef.LabelSelectors.MatchLabels != nil {
+			score += len(applicationRef.LabelSelectors.MatchLabels) * 100
+		}
+		if applicationRef.LabelSelectors.MatchExpressions != nil {
+			score += len(applicationRef.LabelSelectors.MatchExpressions) * 100
+		}
+	}
+	return score
+}
+
+// sortApplicationRefs sorts a slice of ApplicationRef objects from most specific
+// to least specific based on their calculated specificity score. This ensures
+// that more specific rules are applied before broader ones.
+func sortApplicationRefs(applicationRefs []iuapi.ApplicationRef) []iuapi.ApplicationRef {
+	if applicationRefs == nil {
+		return []iuapi.ApplicationRef{}
+	}
+	// Create a copy of the slice to avoid modifying the original.
+	sortedRefs := slices.Clone(applicationRefs)
+
+	// Sort the slice from most specific to least specific.
+	slices.SortStableFunc(sortedRefs, func(a, b iuapi.ApplicationRef) int {
+		// We want descending order (higher score first), so we compare B to A.
+		return cmp.Compare(calculateSpecificity(b), calculateSpecificity(a))
+	})
+	return sortedRefs
+}
+
+// FilterApplicationsForUpdate Retrieve a list of applications from ArgoCD that qualify for image updates
+// Application needs either to be of type Kustomize or Helm.
+func FilterApplicationsForUpdate(ctx context.Context, ctrlClient *ArgoCDK8sClient, kubeClient *kube.ImageUpdaterKubernetesClient, argocdDB db.ArgoDB, cr *iuapi.ImageUpdater, webhookEvent *WebhookEvent) (map[string]ApplicationImages, error) {
+	baseLogger := log.LoggerFromContext(ctx)
+
+	// Validate CR configuration
+	if len(cr.Spec.ApplicationRefs) == 0 {
+		return nil, fmt.Errorf("no application references defined in ImageUpdater CR")
+	}
+
+	// Pre-validate all name patterns in the CR to fail fast on misconfiguration.
+	for _, appRef := range cr.Spec.ApplicationRefs {
+		if _, err := filepath.Match(appRef.NamePattern, "validation"); err != nil {
+			// Wrap the error to provide context about which pattern is invalid.
+			return nil, fmt.Errorf("invalid application name pattern '%s': %w", appRef.NamePattern, err)
+		}
+	}
+
+	allAppsInNamespace := &argocdapi.ApplicationList{}
+	listOpts := []ctrlclient.ListOption{
+		ctrlclient.InNamespace(cr.Namespace),
+	}
+
+	// Perform the app list operation in the target namespace cr.Namespace.
+	baseLogger.Infof("Listing all applications in target namespace: %s", cr.Namespace)
+	if err := ctrlClient.List(ctx, allAppsInNamespace, listOpts...); err != nil {
+		baseLogger.Errorf("Failed to list applications in namespace: %s, error: %v", cr.Namespace, err)
+		return nil, err
+	}
+
+	if len(allAppsInNamespace.Items) == 0 {
+		baseLogger.Infof("No applications found in target namespace: %s", cr.Namespace)
+		return nil, nil
+	}
+
+	var appsForUpdate = make(map[string]ApplicationImages)
+
+	// Sort namePatterns in applicationRefs from most specific to least specific.
+	applicationRefsSorted := sortApplicationRefs(cr.Spec.ApplicationRefs)
+
+	// Establish the base global settings
+	globalUpdateSettings := cr.Spec.CommonUpdateSettings
+	globalImagesVerification := cr.Spec.ImagesVerification
+
+	// For each app in the list, find its best matching rule from the CR.
+	for _, app := range allAppsInNamespace.Items {
+		appNSName := fmt.Sprintf("%s/%s", app.Namespace, app.Name)
+		appLogger := baseLogger.WithField("application", appNSName)
+		appCtx := log.ContextWithLogger(ctx, appLogger)
+
+		// Find the first matching rule for this application
+		for _, applicationRef := range applicationRefsSorted {
+			// We can ignore the error here because we pre-validated all patterns above.
+			// An error from filepath.Match is the only error condition.
+			matches, _ := nameMatchesPattern(appCtx, app.Name, applicationRef.NamePattern)
+			if matches && nameMatchesLabels(appCtx, app.Labels, applicationRef.LabelSelectors) {
+				localAppRef := applicationRef
+				var mergedCommonUpdateSettings *iuapi.CommonUpdateSettings
+				var mergedImagesVerification *iuapi.ImagesVerification
+				var mergedWBCSettings *iuapi.WriteBackConfig
+				var appWBCSettings *WriteBackConfig
+				var err error
+				// When UseAnnotations is true, we ignore all CR-based configuration
+				// (Images, CommonUpdateSettings, WriteBackConfig) and instead read everything from
+				// the Application's legacy argocd-image-updater.argoproj.io/* annotations.
+				// Only NamePattern, LabelSelectors and ImagesVerification are considered at app level.
+				if applicationRef.UseAnnotations != nil && *applicationRef.UseAnnotations {
+					appLogger.Debugf("Read settings from application Annotations")
+
+					appRefImages, err := getImagesFromAnnotations(&app)
+					if err != nil {
+						appLogger.Warnf("Could not create image list, skipping: %v", err)
+						continue
+					}
+
+					appRefWBC := getWriteBackConfigFromAnnotations(&app)
+					appWBCSettings, err = newWBCFromSettings(appCtx, &app, kubeClient, argocdDB, appRefWBC)
+					if err != nil {
+						appLogger.Warnf("Could not create write-back config, skipping: %v", err)
+						continue
+					}
+
+					// Empty alias means we're reading application-wide annotations (not image-specific)
+					updateStrategyAnnotations := getImageUpdateStrategyAnnotations("")
+					mergedCommonUpdateSettings, err = getCommonUpdateSettingsFromAnnotations(&app, updateStrategyAnnotations)
+					if err != nil {
+						appLogger.Warnf("Could not create common update settings, skipping: %v", err)
+						continue
+					}
+
+					// Create a local copy of applicationRef with annotation-derived values
+					localAppRef.Images = appRefImages
+					localAppRef.WriteBackConfig = appRefWBC
+					mergedWBCSettings = appRefWBC
+					mergedImagesVerification = applicationRef.ImagesVerification
+
+				} else {
+					// Calculate the effective settings for this ApplicationRef by layering on top of global.
+					appLogger.Debugf("Read settings from Image Updater CR")
+					mergedCommonUpdateSettings = mergeCommonUpdateSettings(globalUpdateSettings, applicationRef.CommonUpdateSettings)
+					mergedImagesVerification = mergeImagesVerification(globalImagesVerification, applicationRef.ImagesVerification)
+
+					mergedWBCSettings = mergeWBCSettings(cr.Spec.WriteBackConfig, applicationRef.WriteBackConfig)
+					appWBCSettings, err = newWBCFromSettings(appCtx, &app, kubeClient, argocdDB, mergedWBCSettings)
+					if err != nil {
+						appLogger.Warnf("Could not create write-back config, skipping: %v", err)
+						continue
+					}
+				}
+
+				// Only perform expensive marshaling if trace logging is enabled
+				if appLogger.Logger.IsLevelEnabled(logrus.TraceLevel) {
+					appRefJSON, err := json.MarshalIndent(iuapi.ApplicationRef{
+						NamePattern:          localAppRef.NamePattern,
+						LabelSelectors:       localAppRef.LabelSelectors,
+						UseAnnotations:       localAppRef.UseAnnotations,
+						CommonUpdateSettings: mergedCommonUpdateSettings,
+						ImagesVerification:   mergedImagesVerification,
+						WriteBackConfig:      mergedWBCSettings,
+						Images:               localAppRef.Images,
+					}, "", "  ")
+					if err != nil {
+						appLogger.Warnf("Could not marshal application reference: %v", err)
+					} else {
+						appLogger.Tracef("Resulted Image Updater object: %s", string(appRefJSON))
+					}
+				}
+				processApplicationForUpdate(appCtx, kubeClient, &app, localAppRef, mergedCommonUpdateSettings, mergedImagesVerification, appWBCSettings, appNSName, appsForUpdate, webhookEvent)
+				break // Found the best match, move to the next app
+			}
+		}
+	}
+	return appsForUpdate, nil
+}
+
+// mergeCommonUpdateSettings merges a list of CommonUpdateSettings.
+// The later settings in the list take precedence.
+func mergeCommonUpdateSettings(settings ...*iuapi.CommonUpdateSettings) *iuapi.CommonUpdateSettings {
+	merged := &iuapi.CommonUpdateSettings{}
+	for _, s := range settings {
+		if s == nil {
+			continue
+		}
+		if s.UpdateStrategy != nil {
+			merged.UpdateStrategy = s.UpdateStrategy
+		}
+		if s.AllowTags != nil {
+			merged.AllowTags = s.AllowTags
+		}
+		if s.IgnoreTags != nil {
+			merged.IgnoreTags = s.IgnoreTags
+		}
+		if s.PullSecret != nil {
+			merged.PullSecret = s.PullSecret
+		}
+		if s.ForceUpdate != nil {
+			merged.ForceUpdate = s.ForceUpdate
+		}
+		if s.Platforms != nil {
+			merged.Platforms = s.Platforms
+		}
+	}
+	return merged
+}
+
+// mergeImagesVerification merges a list of ImagesVerification.
+// The later settings in the list take precedence.
+func mergeImagesVerification(settings ...*iuapi.ImagesVerification) *iuapi.ImagesVerification {
+	merged := &iuapi.ImagesVerification{}
+	anyNonNil := false
+	for _, s := range settings {
+		if s == nil {
+			continue
+		}
+		anyNonNil = true
+		if s.Enabled != nil {
+			merged.Enabled = s.Enabled
+		}
+		if s.CosignKey != nil {
+			merged.CosignKey = s.CosignKey
+		}
+	}
+	if !anyNonNil {
+		// No imagesVerification block was present at any scope.
+		// Return nil so newImageFromImagesVerification exits early and the
+		// image proceeds without verification (same behaviour as before the
+		// feature was added).
+		return nil
+	}
+	return merged
+}
+
+// newImageFromCommonUpdateSettings creates a new Image from a final, merged set of settings.
+func newImageFromCommonUpdateSettings(ctx context.Context, settings *iuapi.CommonUpdateSettings) *Image {
+	// Start with defaults
+	img := &Image{
+		ContainerImage:     &image.ContainerImage{},
+		UpdateStrategy:     image.StrategySemVer,
+		ForceUpdate:        false,
+		AllowTags:          "",
+		PullSecret:         "",
+		IgnoreTags:         []string{},
+		Platforms:          []string{},
+		HelmImageName:      "",
+		HelmImageTag:       "",
+		HelmImageSpec:      "",
+		KustomizeImageName: "",
+		PluginEnvName:      "",
+		PluginEnvTag:       "",
+		PluginEnvSpec:      "",
+	}
+
+	if settings == nil {
+		return img
+	}
+
+	// Apply the final settings.
+	if settings.UpdateStrategy != nil {
+		img.UpdateStrategy = img.ParseUpdateStrategy(ctx, *settings.UpdateStrategy)
+	}
+	if settings.ForceUpdate != nil {
+		img.ForceUpdate = *settings.ForceUpdate
+	}
+	if settings.AllowTags != nil {
+		img.AllowTags = *settings.AllowTags
+	}
+	if settings.PullSecret != nil {
+		img.PullSecret = *settings.PullSecret
+	}
+	if settings.IgnoreTags != nil {
+		img.IgnoreTags = settings.IgnoreTags
+	}
+	if settings.Platforms != nil {
+		img.Platforms = settings.Platforms
+	}
+
+	return img
+}
+
+// countPullRequestProviders returns the number of providers configured in a PullRequest.
+// A valid PullRequest must have exactly one provider set. When adding a new provider,
+// add a corresponding branch here to keep the count accurate.
+func countPullRequestProviders(pr *iuapi.PullRequest) int {
+	count := 0
+	if pr.GitHub != nil {
+		count++
+	}
+	if pr.GitLab != nil {
+		count++
+	}
+	if pr.AzureDevOps != nil {
+		count++
+	}
+	if pr.Gitea != nil {
+		count++
+	}
+	return count
+}
+
+// sanitizePRLabels trims whitespace and drops empty entries and duplicates from
+// the configured pull/merge request labels, preserving the configured order.
+func sanitizePRLabels(labels []string) []string {
+	if len(labels) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(labels))
+	out := make([]string, 0, len(labels))
+	for _, l := range labels {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if _, dup := seen[l]; dup {
+			continue
+		}
+		seen[l] = struct{}{}
+		out = append(out, l)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// mergeWBCSettings merges global and app-specific WriteBackConfig settings.
+// App-specific settings take precedence over global settings.
+// A nil Method on the app level means "inherit from global" (not "default to argocd").
+// Defaulting a nil Method to WriteBackMethodArgoCD is the sole responsibility of newWBCFromSettings.
+func mergeWBCSettings(global *iuapi.WriteBackConfig, appWBC *iuapi.WriteBackConfig) *iuapi.WriteBackConfig {
+	if global == nil && appWBC == nil {
+		return &iuapi.WriteBackConfig{}
+	}
+
+	// Start with a clone of global to prevent modification
+	merged := &iuapi.WriteBackConfig{}
+	if global != nil {
+		merged = global.DeepCopy()
+	}
+
+	if appWBC == nil {
+		return merged
+	}
+
+	if appWBC.Method != nil {
+		merged.Method = appWBC.Method
+	}
+
+	if appWBC.GitConfig != nil {
+		if merged.GitConfig == nil {
+			merged.GitConfig = &iuapi.GitConfig{}
+		}
+		if appWBC.GitConfig.Repository != nil {
+			merged.GitConfig.Repository = appWBC.GitConfig.Repository
+		}
+		if appWBC.GitConfig.Branch != nil {
+			merged.GitConfig.Branch = appWBC.GitConfig.Branch
+		}
+		if appWBC.GitConfig.WriteBackTarget != nil {
+			merged.GitConfig.WriteBackTarget = appWBC.GitConfig.WriteBackTarget
+		}
+		if appWBC.GitConfig.PullRequest != nil {
+			// App-level PullRequest replaces the global entirely. Providers are a
+			// mutually-exclusive choice, so field-by-field merging across levels
+			// (e.g. global github + app gitlab) would produce two providers and
+			// fail validation in newWBCFromSettings.
+			merged.GitConfig.PullRequest = appWBC.GitConfig.PullRequest.DeepCopy()
+		}
+	}
+	return merged
+}
+
+// newWBCFromSettings creates a new WriteBackConfig from a given, final set of
+// settings within the context of a specific application. It is responsible for
+// resolving all app-dependent fields, like target paths.
+func newWBCFromSettings(ctx context.Context, app *argocdapi.Application, kubeClient *kube.ImageUpdaterKubernetesClient, argocdDB db.ArgoDB, settings *iuapi.WriteBackConfig) (*WriteBackConfig, error) {
+	wbc := &WriteBackConfig{
+		Method:                 WriteBackApplication,
+		ArgoClient:             nil,
+		ArgocdDB:               argocdDB,
+		GitClient:              nil,
+		GetCreds:               nil,
+		GitBranch:              "",
+		GitWriteBranch:         "",
+		GitCommitUser:          "",
+		GitCommitEmail:         "",
+		GitCommitMessage:       "",
+		GitCommitSigningKey:    "",
+		GitCommitSigningMethod: "",
+		GitCommitSignOff:       false,
+		GitCommitMethod:        "",
+		KustomizeBase:          "",
+		Target:                 "", // Will be set by parseDefaultTarget
+		GitRepo:                "",
+		GitCreds:               nil,
+		PRProvider:             PRProviderUnsupported,
+	}
+
+	appSource := getApplicationSource(ctx, app, nil)
+	if appSource == nil {
+		return nil, fmt.Errorf("application source is not defined for %s/%s", app.Namespace, app.Name)
+	}
+
+	// Set a default target. This will be used by the ArgoCD method, or by the Git method if no explicit target is given.
+	wbc.Target = parseDefaultTarget(app.GetNamespace(), app.Name, appSource.Path, kubeClient)
+
+	if settings == nil {
+		return wbc, nil
+	}
+
+	// If no method is specified, or it's explicitly the argocd method, we are done.
+	if settings.Method == nil || strings.TrimSpace(*settings.Method) == WriteBackMethodArgoCD {
+		return wbc, nil
+	}
+
+	// Determine method and credentials from the method string
+	method := strings.TrimSpace(*settings.Method)
+	creds := "repocreds"
+	if index := strings.Index(method, ":"); index > 0 {
+		creds = method[index+1:]
+		method = method[:index]
+	}
+
+	if method == "git" {
+		wbc.Method = WriteBackGit
+		// If an explicit write-back target is given, parse and apply it. Otherwise,
+		// the default target set above will be used.
+		if settings.GitConfig != nil && settings.GitConfig.WriteBackTarget != nil {
+			target := *settings.GitConfig.WriteBackTarget
+			if strings.HasPrefix(target, common.KustomizationPrefix) {
+				wbc.KustomizeBase = parseKustomizeBase(target, appSource.Path)
+			} else if strings.HasPrefix(target, common.HelmPrefix) {
+				wbc.Target = parseTarget(target, appSource.Path)
+			} else {
+				// A bare target whose file name is a standard kustomization file name is
+				// almost always a misconfiguration: writing image parameter overrides to a
+				// real kustomization.yaml would discard its existing content. Catch this
+				// early with a clear error rather than letting it fail later, deeper in the
+				// write-back path.
+				base := filepath.Base(target)
+				if base == "kustomization.yaml" || base == "kustomization.yml" || base == "Kustomization" {
+					return nil, fmt.Errorf(
+						`git write-back target %q looks like a standard kustomization file; `+
+							`writing image parameter overrides to it would discard its existing content. `+
+							`Use writeBackTarget: "kustomization:<path>" to update it in place instead, `+
+							`or point the target at a dedicated override file`, target)
+				}
+				wbc.Target = target
+			}
+		}
+		// Parse all other git-related configurations
+		if err := parseGitConfig(ctx, app, kubeClient, settings, wbc, creds); err != nil {
+			return nil, err
+		}
+		if settings.GitConfig != nil && settings.GitConfig.PullRequest != nil {
+			// Pull request mode doesn't support the colon branch format `base:target`.
+			// Specify only the PR base branch (e.g. branch: "main").
+			if settings.GitConfig.Branch != nil && strings.Contains(*settings.GitConfig.Branch, ":") {
+				return nil, fmt.Errorf("pullRequest mode does not support colon branch format %q: specify only the PR base branch (e.g. \"main\")", *settings.GitConfig.Branch)
+			}
+
+			n := countPullRequestProviders(settings.GitConfig.PullRequest)
+			if n != 1 {
+				return nil, fmt.Errorf("pullRequest must have exactly one provider configured, got %d", n)
+			}
+
+			if settings.GitConfig.PullRequest.GitHub != nil {
+				wbc.PRProvider = PRProviderGitHub
+			}
+			if settings.GitConfig.PullRequest.GitLab != nil {
+				wbc.PRProvider = PRProviderGitLab
+			}
+			if settings.GitConfig.PullRequest.AzureDevOps != nil {
+				wbc.PRProvider = PRProviderAzureDevOps
+			}
+			if settings.GitConfig.PullRequest.Gitea != nil {
+				wbc.PRProvider = PRProviderGitea
+			}
+
+			wbc.PRLabels = sanitizePRLabels(settings.GitConfig.PullRequest.Labels)
+		}
+	} else {
+		return nil, fmt.Errorf("invalid update mechanism: %s", *settings.Method)
+	}
+
+	return wbc, nil
+}
+
+// newImageFromManifestTargetSettings creates a new Image and populates it
+// by layering the given Manifest target settings.
+func newImageFromManifestTargetSettings(settings *iuapi.ManifestTarget, img *Image) (*Image, error) {
+	if settings == nil {
+		return img, nil
+	}
+
+	count := 0
+	if settings.Helm != nil {
+		count++
+	}
+	if settings.Kustomize != nil {
+		count++
+	}
+	if settings.Plugin != nil {
+		count++
+	}
+	if count > 1 {
+		return nil, fmt.Errorf("only one of the fields (Helm, Kustomize, Plugin) should be set, dictating the update method")
+	}
+
+	// Layer the new settings on top, only if they are explicitly set (non-nil).
+	if settings.Helm != nil && settings.Helm.Spec != nil {
+		img.HelmImageSpec = *settings.Helm.Spec
+	} else {
+		if settings.Helm != nil && settings.Helm.Name != nil {
+			img.HelmImageName = *settings.Helm.Name
+		}
+		if settings.Helm != nil && settings.Helm.Tag != nil {
+			img.HelmImageTag = *settings.Helm.Tag
+		}
+	}
+	if settings.Kustomize != nil && settings.Kustomize.Name != nil {
+		img.KustomizeImageName = *settings.Kustomize.Name
+	}
+	if settings.Plugin != nil && settings.Plugin.Spec != nil {
+		img.PluginEnvSpec = *settings.Plugin.Spec
+	} else {
+		if settings.Plugin != nil && settings.Plugin.Name != nil {
+			img.PluginEnvName = *settings.Plugin.Name
+		}
+		if settings.Plugin != nil && settings.Plugin.Tag != nil {
+			img.PluginEnvTag = *settings.Plugin.Tag
+		}
+	}
+
+	return img, nil
+}
+
+// newImageFromImagesVerification creates a new Image and populates it
+// by layering the given ImagesVerification settings.
+func newImageFromImagesVerification(kubeClient *kube.ImageUpdaterKubernetesClient, appNamespace string, settings *iuapi.ImagesVerification, img *Image) (*Image, error) {
+	if settings == nil {
+		return img, nil
+	}
+
+	// if empty fall back to default Enable == true
+	img.EnableVerification = true // default when block is present
+	if settings.Enabled != nil {
+		img.EnableVerification = *settings.Enabled
+	}
+
+	if !img.EnableVerification {
+		return img, nil // opted out
+	}
+
+	if img.Verify == nil {
+		img.Verify = &image.Verify{}
+	}
+
+	if settings.CosignKey != nil {
+		var err error
+		img.Verify.CosignKey, err = kubeClient.KubeClient.GetSecretField(appNamespace, settings.CosignKey.SecretName, settings.CosignKey.Key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch public key secret field: %v", err)
+		}
+	} else {
+		return nil, fmt.Errorf("cosignKey is required when verification is enabled")
+	}
+
+	return img, nil
+}
+
+// parseImageList parses a list of ImageConfig objects from the ImageUpdater CR
+// into a ImageList, which is used internally for image management.
+func parseImageList(ctx context.Context, kubeClient *kube.ImageUpdaterKubernetesClient, appNamespace string, images []iuapi.ImageConfig, appSettings *iuapi.CommonUpdateSettings, appImagesVerification *iuapi.ImagesVerification, webhookEvent *WebhookEvent) *ImageList {
+	log := log.LoggerFromContext(ctx)
+	results := make(ImageList, 0)
+	for _, im := range images {
+		// For each image, calculate its final settings by layering its specific
+		// settings on top of the application-level settings.
+		finalCommonUpdateSettings := mergeCommonUpdateSettings(appSettings, im.CommonUpdateSettings)
+		img := newImageFromCommonUpdateSettings(ctx, finalCommonUpdateSettings)
+
+		img, err := newImageFromManifestTargetSettings(im.ManifestTarget, img)
+		if err != nil {
+			log.Warnf("Could not set manifest target config for image %s, skipping: %v", im.ImageName, err)
+			continue
+		}
+
+		finalCommonImageVerification := mergeImagesVerification(appImagesVerification, im.ImagesVerification)
+		img, err = newImageFromImagesVerification(kubeClient, appNamespace, finalCommonImageVerification, img)
+		if err != nil {
+			log.Warnf("Could not set images verification settings for image %s, skipping: %v", im.ImageName, err)
+			continue
+		}
+
+		img.ContainerImage = image.NewFromIdentifier(im.Alias + "=" + im.ImageName)
+
+		// Catch a strategy that cannot work with the tag the image is
+		// configured with while the configuration is being read. This runs
+		// every cycle, like the rest of this function, but it fails before the
+		// registry is asked for anything, which is what the round-trip per
+		// cycle would otherwise cost.
+		if err := img.ContainerImage.ValidateUpdateStrategy(img.UpdateStrategy); err != nil {
+			log.Warnf("Skipping image %s: the %s strategy reads the tag as its layout, and this one cannot be used: %v", im.ImageName, img.UpdateStrategy, err)
+			continue
+		}
+
+		// Check if any of the images match the webhook event
+		if webhookEvent != nil {
+			log.Debugf("Checking webhook match for image `%s`: event=(%s/%s), image=(%s/%s)",
+				im.Alias, webhookEvent.RegistryURL, webhookEvent.Repository,
+				img.ContainerImage.RegistryURL, img.ContainerImage.ImageName)
+
+			// Skip if registry doesn't match
+			if img.ContainerImage.RegistryURL != "" && img.ContainerImage.RegistryURL != webhookEvent.RegistryURL {
+				log.Debugf("Registry mismatch for image `%s`: %s != %s", im.Alias, img.ContainerImage.RegistryURL, webhookEvent.RegistryURL)
+				continue
+			}
+
+			// Check if repository matches
+			if img.ContainerImage.ImageName != webhookEvent.Repository {
+				log.Debugf("Repository mismatch for image `%s`: %s != %s", im.Alias, img.ContainerImage.ImageName, webhookEvent.Repository)
+				continue
+			}
+
+			log.Infof("Image `%s` matches webhook event=(%s/%s)", im.Alias, webhookEvent.RegistryURL, webhookEvent.Repository)
+		}
+
+		if im.ManifestTarget != nil && im.ManifestTarget.Kustomize != nil && im.ManifestTarget.Kustomize.Name != nil {
+			if kustomizeImage := im.ManifestTarget.Kustomize.Name; *kustomizeImage != "" {
+				img.ContainerImage.KustomizeImage = image.NewFromIdentifier(*kustomizeImage)
+			}
+		}
+		results = append(results, img)
+	}
+
+	return &results
+}
+
+// getHelmParamNames inspects the given image for whether
+// the Helm parameter names are being set and
+// returns their values.
+func getHelmParamNames(img *Image) (string, string) {
+	// Return default values without symbolic name given
+	if img == nil || img.ImageAlias == "" {
+		return common.DefaultHelmImageName, common.DefaultHelmImageTag
+	}
+
+	// Image spec is a full-qualified specifier, if we have it, we return early
+	if param := img.HelmImageSpec; param != "" {
+		return strings.TrimSpace(param), ""
+	}
+
+	// The defaults only apply when neither name nor tag is configured. When the
+	// user configured just one of them, the other one stays empty so that it is
+	// not written at all - defaulting it would point every such image at the
+	// same "image.name"/"image.tag" path, where the images silently overwrite
+	// each other and leave a single stray key behind.
+	if img.HelmImageName == "" && img.HelmImageTag == "" {
+		return common.DefaultHelmImageName, common.DefaultHelmImageTag
+	}
+
+	return img.HelmImageName, img.HelmImageTag
+}
+
+// Get a named helm parameter from a list of parameters
+func getHelmParam(params []argocdapi.HelmParameter, name string) *argocdapi.HelmParameter {
+	for _, param := range params {
+		if param.Name == name {
+			return &param
+		}
+	}
+	return nil
+}
+
+// mergeHelmParams merges a list of Helm parameters specified by merge into the
+// Helm parameters given as src.
+func mergeHelmParams(src []argocdapi.HelmParameter, merge []argocdapi.HelmParameter) []argocdapi.HelmParameter {
+	retParams := make([]argocdapi.HelmParameter, 0)
+	merged := make(map[string]any)
+
+	// first look for params that need replacement
+	for _, srcParam := range src {
+		found := false
+		for _, mergeParam := range merge {
+			if srcParam.Name == mergeParam.Name {
+				retParams = append(retParams, mergeParam)
+				merged[mergeParam.Name] = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			retParams = append(retParams, srcParam)
+		}
+	}
+
+	// then check which we still need in dest list and merge those, too
+	for _, mergeParam := range merge {
+		if _, ok := merged[mergeParam.Name]; !ok {
+			retParams = append(retParams, mergeParam)
+		}
+	}
+
+	return retParams
+}
+
+// GetHelmImage gets the image set in Application source matching new image
+// or an empty string if match is not found
+func GetHelmImage(ctx context.Context, app *argocdapi.Application, wbc *WriteBackConfig, applicationImage *Image) (string, error) {
+
+	if appType := getApplicationType(app, wbc); appType != ApplicationTypeHelm {
+		return "", fmt.Errorf("cannot set Helm params on non-Helm application")
+	}
+
+	var hpImageName, hpImageTag, hpImageSpec string
+
+	hpImageSpec = applicationImage.HelmImageSpec
+	hpImageName = applicationImage.HelmImageName
+	hpImageTag = applicationImage.HelmImageTag
+
+	// See getHelmParamNames - the defaults only kick in when nothing at all is
+	// configured. A partially configured image leaves the other parameter name
+	// empty, and getHelmParam below then simply finds no match for it.
+	if hpImageSpec == "" && hpImageName == "" && hpImageTag == "" {
+		hpImageName = common.DefaultHelmImageName
+		hpImageTag = common.DefaultHelmImageTag
+	}
+
+	appSource := getApplicationSource(ctx, app, wbc)
+
+	if appSource.Helm == nil {
+		return "", nil
+	}
+
+	if appSource.Helm.Parameters == nil {
+		return "", nil
+	}
+
+	if hpImageSpec != "" {
+		if p := getHelmParam(appSource.Helm.Parameters, hpImageSpec); p != nil {
+			return p.Value, nil
+		}
+	} else {
+		imageName := getHelmParam(appSource.Helm.Parameters, hpImageName)
+		imageTag := getHelmParam(appSource.Helm.Parameters, hpImageTag)
+		if imageName == nil || imageTag == nil {
+			return "", nil
+		}
+		return imageName.Value + ":" + imageTag.Value, nil
+	}
+
+	return "", nil
+}
+
+// SetHelmImage sets image parameters for a Helm application
+func SetHelmImage(ctx context.Context, app *argocdapi.Application, newImage *image.ContainerImage, wbc *WriteBackConfig, applicationImage *Image) error {
+	log := log.LoggerFromContext(ctx)
+	if appType := getApplicationType(app, wbc); appType != ApplicationTypeHelm {
+		return fmt.Errorf("cannot set Helm params on non-Helm application")
+	}
+
+	var hpImageName, hpImageTag, hpImageSpec string
+
+	hpImageSpec = applicationImage.HelmImageSpec
+	hpImageName = applicationImage.HelmImageName
+	hpImageTag = applicationImage.HelmImageTag
+
+	// See getHelmParamNames - the defaults only kick in when nothing at all is
+	// configured, so that a partially configured image does not have the other
+	// half of its parameters invented for it.
+	if hpImageSpec == "" && hpImageName == "" && hpImageTag == "" {
+		hpImageName = common.DefaultHelmImageName
+		hpImageTag = common.DefaultHelmImageTag
+	}
+
+	log.Debugf("target parameters: image-spec=%s image-name=%s, image-tag=%s", hpImageSpec, hpImageName, hpImageTag)
+
+	mergeParams := make([]argocdapi.HelmParameter, 0)
+
+	// The logic behind this is that image-spec is an override - if this is set,
+	// we simply ignore any image-name and image-tag parameters that might be
+	// there.
+	if hpImageSpec != "" {
+		p := argocdapi.HelmParameter{Name: hpImageSpec, Value: newImage.GetFullNameWithTag(), ForceString: true}
+		mergeParams = append(mergeParams, p)
+	} else {
+		// Only set a parameter the image actually configured - see the defaulting
+		// above. An image tracking just the tag must not get an image name
+		// parameter invented for it, and vice versa.
+		if hpImageName != "" {
+			mergeParams = append(mergeParams,
+				argocdapi.HelmParameter{Name: hpImageName, Value: newImage.GetFullNameWithoutTag(), ForceString: true},
+			)
+		}
+		// Only set the tag parameter if we have a non-empty tag value.
+		// When forceUpdate is enabled and no tag is specified, the tag can be empty.
+		// Setting an empty tag would overwrite existing tag values and cause invalid image references.
+		if tagValue := newImage.GetTagWithDigest(); hpImageTag != "" && tagValue != "" {
+			mergeParams = append(mergeParams,
+				argocdapi.HelmParameter{Name: hpImageTag, Value: tagValue, ForceString: true},
+			)
+		}
+	}
+
+	appSource := getApplicationSource(ctx, app, wbc)
+
+	if appSource.Helm == nil {
+		appSource.Helm = &argocdapi.ApplicationSourceHelm{}
+	}
+
+	if appSource.Helm.Parameters == nil {
+		appSource.Helm.Parameters = make([]argocdapi.HelmParameter, 0)
+	}
+
+	appSource.Helm.Parameters = mergeHelmParams(appSource.Helm.Parameters, mergeParams)
+
+	persistSourceHydratorMutation(app, appSource)
+
+	return nil
+}
+
+// GetKustomizeImage gets the image set in Application source matching new image
+// or an empty string if match is not found
+func GetKustomizeImage(ctx context.Context, app *argocdapi.Application, wbc *WriteBackConfig, applicationImage *Image) (string, error) {
+	if appType := getApplicationType(app, wbc); appType != ApplicationTypeKustomize {
+		return "", fmt.Errorf("cannot set Kustomize image on non-Kustomize application")
+	}
+
+	ksImageName := applicationImage.KustomizeImageName
+
+	appSource := getApplicationSource(ctx, app, wbc)
+
+	if appSource.Kustomize == nil {
+		return "", nil
+	}
+
+	ksImages := appSource.Kustomize.Images
+
+	if ksImages == nil {
+		return "", nil
+	}
+
+	for _, a := range ksImages {
+		curr := image.NewFromIdentifier(string(a))
+
+		// Entries must always agree on ImageName (registry+repo). When
+		// manifestTargets.kustomize.name is set and the entry already carries
+		// an alias, that alias must also match - otherwise two entries that
+		// share the same ImageName but target different kustomize image
+		// aliases would be treated as the same entry.
+		matched := curr.ImageName == applicationImage.ImageName
+		if ksImageName != "" && curr.ImageAlias != "" {
+			matched = matched && curr.ImageAlias == ksImageName
+		}
+
+		if matched {
+			return string(a), nil
+		}
+	}
+
+	return "", nil
+}
+
+// SetKustomizeImage sets a Kustomize image for given application
+func SetKustomizeImage(ctx context.Context, app *argocdapi.Application, newImage *image.ContainerImage, wbc *WriteBackConfig, applicationImage *Image) error {
+	log := log.LoggerFromContext(ctx)
+	if appType := getApplicationType(app, wbc); appType != ApplicationTypeKustomize {
+		return fmt.Errorf("cannot set Kustomize image on non-Kustomize application")
+	}
+
+	var ksImageParam string
+	ksImageName := applicationImage.KustomizeImageName
+	if ksImageName != "" {
+		ksImageParam = fmt.Sprintf("%s=%s", ksImageName, newImage.GetFullNameWithTag())
+	} else {
+		ksImageParam = newImage.GetFullNameWithTag()
+	}
+
+	log.Tracef("Setting Kustomize parameter %s", ksImageParam)
+
+	appSource := getApplicationSource(ctx, app, wbc)
+
+	if appSource.Kustomize == nil {
+		appSource.Kustomize = &argocdapi.ApplicationSourceKustomize{}
+	}
+
+	for i, kImg := range appSource.Kustomize.Images {
+		curr := image.NewFromIdentifier(string(kImg))
+		override := image.NewFromIdentifier(ksImageParam)
+
+		// Entries must always agree on ImageName (registry+repo). When
+		// manifestTargets.kustomize.name is set and the entry already carries
+		// an alias, that alias must also match - otherwise two entries that
+		// share the same ImageName but target different kustomize image
+		// aliases would collapse onto the same slot, silently dropping one of
+		// them.
+		matched := curr.ImageName == override.ImageName
+		if ksImageName != "" && curr.ImageAlias != "" {
+			matched = matched && curr.ImageAlias == ksImageName
+		}
+
+		if matched {
+			curr.ImageAlias = override.ImageAlias
+			appSource.Kustomize.Images[i] = argocdapi.KustomizeImage(override.String())
+		}
+
+	}
+
+	appSource.Kustomize.MergeImage(argocdapi.KustomizeImage(ksImageParam))
+
+	persistSourceHydratorMutation(app, appSource)
+
+	return nil
+}
+
+func getPluginEnv(env argocdapi.Env, name string) string {
+	for _, e := range env {
+		if e != nil && e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
+}
+
+// GetPluginImage gets the image set in Application source's plugin env vars
+// matching the configured env var names, or an empty string if not found.
+func GetPluginImage(ctx context.Context, app *argocdapi.Application, wbc *WriteBackConfig, applicationImage *Image) (string, error) {
+	// Use getApplicationSourceType (raw source type) instead of getApplicationType here,
+	// because getApplicationType maps plugin+git write-back to ApplicationTypeHelm for
+	// backward compatibility with the Helm hack. The raw source type correctly identifies
+	// plugin apps regardless of the write-back method.
+	if sourceType := getApplicationSourceType(app, wbc); sourceType != argocdapi.ApplicationSourceTypePlugin {
+		return "", fmt.Errorf("cannot get Plugin env vars from non-Plugin application")
+	}
+
+	appSource := getApplicationSource(ctx, app, wbc)
+	if appSource.Plugin == nil || len(appSource.Plugin.Env) == 0 {
+		return "", nil
+	}
+
+	peEnvSpec := applicationImage.PluginEnvSpec
+	peEnvName := applicationImage.PluginEnvName
+	peEnvTag := applicationImage.PluginEnvTag
+
+	if peEnvSpec != "" {
+		if v := getPluginEnv(appSource.Plugin.Env, peEnvSpec); v != "" {
+			return v, nil
+		}
+	} else if peEnvName != "" && peEnvTag != "" {
+		name := getPluginEnv(appSource.Plugin.Env, peEnvName)
+		tag := getPluginEnv(appSource.Plugin.Env, peEnvTag)
+		if name != "" && tag != "" {
+			return name + ":" + tag, nil
+		}
+	}
+
+	return "", nil
+}
+
+// SetPluginImage sets image env vars on a plugin application's source
+func SetPluginImage(ctx context.Context, app *argocdapi.Application, newImage *image.ContainerImage, wbc *WriteBackConfig, applicationImage *Image) error {
+	log := log.LoggerFromContext(ctx)
+	// Use getApplicationSourceType (raw source type) instead of getApplicationType here,
+	// because getApplicationType maps plugin+git write-back to ApplicationTypeHelm for
+	// backward compatibility with the Helm hack. The raw source type correctly identifies
+	// plugin apps regardless of the write-back method.
+	if sourceType := getApplicationSourceType(app, wbc); sourceType != argocdapi.ApplicationSourceTypePlugin {
+		return fmt.Errorf("cannot set Plugin env vars on non-Plugin application")
+	}
+
+	peEnvSpec := applicationImage.PluginEnvSpec
+	peEnvName := applicationImage.PluginEnvName
+	peEnvTag := applicationImage.PluginEnvTag
+
+	log.Debugf("target plugin env vars: env-spec=%s env-name=%s, env-tag=%s", peEnvSpec, peEnvName, peEnvTag)
+
+	appSource := getApplicationSource(ctx, app, wbc)
+	if appSource.Plugin == nil {
+		appSource.Plugin = &argocdapi.ApplicationSourcePlugin{}
+	}
+
+	if peEnvSpec != "" {
+		appSource.Plugin.AddEnvEntry(&argocdapi.EnvEntry{
+			Name:  peEnvSpec,
+			Value: newImage.GetFullNameWithTag(),
+		})
+	} else {
+		if peEnvName != "" {
+			appSource.Plugin.AddEnvEntry(&argocdapi.EnvEntry{
+				Name:  peEnvName,
+				Value: newImage.GetFullNameWithoutTag(),
+			})
+		}
+		if peEnvTag != "" {
+			if tagValue := newImage.GetTagWithDigest(); tagValue != "" {
+				appSource.Plugin.AddEnvEntry(&argocdapi.EnvEntry{
+					Name:  peEnvTag,
+					Value: tagValue,
+				})
+			}
+		}
+	}
+
+	persistSourceHydratorMutation(app, appSource)
+
+	return nil
+}
+
+// GetImagesFromApplication returns the list of known images for the given application
+func GetImagesFromApplication(applicationImages *ApplicationImages) image.ContainerImageList {
+	images := make(image.ContainerImageList, 0)
+	app := applicationImages.Application
+
+	// Get images deployed with the current ArgoCD app.
+	for _, imageStr := range app.Status.Summary.Images {
+		image := image.NewFromIdentifier(imageStr)
+		images = append(images, image)
+	}
+
+	for _, img := range applicationImages.Images {
+		if img.ForceUpdate {
+			// Create a copy of the container image with nil tag to add to the live images list.
+			// The tag from the image list will be a version constraint, which isn't a valid tag.
+			// We preserve the original img.ContainerImage so the constraint is available later.
+			imgCopy := img.ContainerImage.WithTag(nil)
+			// Avoid duplicates if an entry already exists for this image (ignore tag for match).
+			if images.ContainsImage(img.ContainerImage, false) == nil {
+				images = append(images, imgCopy)
+			}
+		}
+	}
+
+	return images
+}
+
+// GetImagesAndAliasesFromApplication returns only the images that are considered
+// "live", with ImageAlias and ContainerImage set from the corresponding entry
+// returned by GetImagesFromApplication.
+//
+// The live-image set is built by GetImagesFromApplication from two sources:
+//   - app.Status.Summary.Images — images actually running in the cluster.
+//   - Force-update images — configured images with ForceUpdate == true are
+//     injected with a nil tag so they are always treated as live even when no
+//     running container is detected.
+//
+// For each image in applicationImages.Images the function checks whether it is live
+// (i.e. present in GetImagesFromApplication). Images that are not live are silently
+// dropped from the result. For each live image:
+//   - ContainerImage is replaced with the live instance, which carries the actual
+//     running tag (or nil for force-update images). This is a mutation of the
+//     original *Image element.
+//   - ImageAlias is set from the configured alias (or ImageName as fallback).
+//
+// When two configured aliases reference the same live image, the second alias
+// receives a shallow copy of the live ContainerImage so that both alias entries
+// carry independent ImageAlias values without interfering with each other.
+//
+// TODO: this function together with GetImagesFromApplication should be refactored. We iterate through
+// applicationImages.Images 3 times in one place (2 in functions and in containerImages.ContainsImage).
+// Also the 4th loop is in marshalParamsOverride. See GITOPS-7415
+func GetImagesAndAliasesFromApplication(applicationImages *ApplicationImages) ImageList {
+	containerImages := GetImagesFromApplication(applicationImages)
+
+	result := make(ImageList, 0, len(applicationImages.Images))
+
+	// We iterate through the list of images with alias information.
+	for _, aliasedImage := range applicationImages.Images {
+		// For each one, we find its corresponding entry in the list of live images.
+		// Images not found here are not live and are excluded from the result.
+		if sourceImage := containerImages.ContainsImage(aliasedImage.ContainerImage, false); sourceImage != nil {
+			if sourceImage.ImageAlias != "" {
+				// This live image has already been matched to a previous alias, so create
+				// a copy to avoid overwriting the existing alias association.
+				imageCopy := *sourceImage
+				if aliasedImage.ImageAlias == "" {
+					imageCopy.ImageAlias = aliasedImage.ImageName
+				} else {
+					imageCopy.ImageAlias = aliasedImage.ImageAlias
+				}
+				aliasedImage.ContainerImage = &imageCopy
+			} else {
+				// This is the first alias for this live image. We can modify it in place.
+				if aliasedImage.ImageAlias == "" {
+					sourceImage.ImageAlias = aliasedImage.ImageName
+				} else {
+					sourceImage.ImageAlias = aliasedImage.ImageAlias
+				}
+				aliasedImage.ContainerImage = sourceImage
+			}
+			result = append(result, aliasedImage)
+		}
+	}
+
+	return result
+}
+
+// GetApplicationType returns the type of the ArgoCD application
+func GetApplicationType(app *argocdapi.Application, wbc *WriteBackConfig) ApplicationType {
+	return getApplicationType(app, wbc)
+}
+
+// GetApplicationSourceType returns the source type of the ArgoCD application
+func GetApplicationSourceType(app *argocdapi.Application, wbc *WriteBackConfig) argocdapi.ApplicationSourceType {
+	return getApplicationSourceType(app, wbc)
+}
+
+// GetApplicationSource returns the main source of a Helm or Kustomize type of the ArgoCD application
+func GetApplicationSource(ctx context.Context, app *argocdapi.Application, wbc *WriteBackConfig) *argocdapi.ApplicationSource {
+	return getApplicationSource(ctx, app, wbc)
+}
+
+// IsValidApplicationType returns true if we can update the application
+func IsValidApplicationType(app *argocdapi.Application, wbc *WriteBackConfig) bool {
+	return getApplicationType(app, wbc) != ApplicationTypeUnsupported
+}
+
+// getApplicationType returns the type of the application
+func getApplicationType(app *argocdapi.Application, wbc *WriteBackConfig) ApplicationType {
+	sourceType := getApplicationSourceType(app, wbc)
+
+	if sourceType == argocdapi.ApplicationSourceTypeKustomize {
+		return ApplicationTypeKustomize
+	} else if sourceType == argocdapi.ApplicationSourceTypeHelm {
+		return ApplicationTypeHelm
+	} else if sourceType == argocdapi.ApplicationSourceTypePlugin {
+		if wbc != nil && wbc.Method == WriteBackGit {
+			// Backward compat: plugin apps with git write-back default to Helm serialization.
+			// Users with manifestTargets.helm on plugin apps continue working unchanged.
+			// The per-image plugin target check in getAppImage/setAppImage overrides this
+			// for images that have manifestTargets.plugin configured.
+			return ApplicationTypeHelm
+		}
+		return ApplicationTypePlugin
+	} else {
+		return ApplicationTypeUnsupported
+	}
+}
+
+// getApplicationSourceType returns the source type of the application
+func getApplicationSourceType(app *argocdapi.Application, wbc *WriteBackConfig) argocdapi.ApplicationSourceType {
+	if wbc != nil {
+		if wbc.KustomizeBase != "" {
+			return argocdapi.ApplicationSourceTypeKustomize
+		}
+		// Check if the target is a helmvalues path (ends with .yaml or .yml)
+		// but exclude the default override file format (.argocd-source-*.yaml)
+		if wbc.Target != "" && (strings.HasSuffix(wbc.Target, ".yaml") || strings.HasSuffix(wbc.Target, ".yml")) {
+			targetBase := filepath.Base(wbc.Target)
+			if !strings.HasPrefix(targetBase, common.DefaultTargetFilePrefix) {
+				return argocdapi.ApplicationSourceTypeHelm
+			}
+		}
+	}
+	if app.Spec.HasMultipleSources() {
+		for _, st := range app.Status.SourceTypes {
+			if st == argocdapi.ApplicationSourceTypeHelm {
+				return argocdapi.ApplicationSourceTypeHelm
+			} else if st == argocdapi.ApplicationSourceTypeKustomize {
+				return argocdapi.ApplicationSourceTypeKustomize
+			} else if st == argocdapi.ApplicationSourceTypePlugin {
+				return argocdapi.ApplicationSourceTypePlugin
+			}
+		}
+		return argocdapi.ApplicationSourceTypeDirectory
+	}
+
+	// For SourceHydrator apps, Status.SourceType reflects the sync source (typically
+	// "Directory" since it syncs rendered manifests), not the dry source. If the DrySource
+	// has explicit Helm/Kustomize/Plugin config, use that to determine the actual type.
+	//
+	// Plugin is checked first: a CMP is only ever configured explicitly, while a Helm or
+	// Kustomize block can be one we added ourselves. persistSourceHydratorMutation writes
+	// the staged parameters back into the DrySource, and on a plugin app with git
+	// write-back SetHelmImage is the serializer for images that use manifestTargets.helm
+	// (see getApplicationType), so DrySource.Helm can become non-nil mid-cycle. Checking
+	// Helm first would reclassify the app as Helm from that point on and make the next
+	// SetPluginImage/GetPluginImage for an image with manifestTargets.plugin fail.
+	if app.Spec.SourceHydrator != nil {
+		ds := app.Spec.SourceHydrator.DrySource
+		if ds.Plugin != nil {
+			return argocdapi.ApplicationSourceTypePlugin
+		}
+		if ds.Helm != nil {
+			return argocdapi.ApplicationSourceTypeHelm
+		}
+		if ds.Kustomize != nil {
+			return argocdapi.ApplicationSourceTypeKustomize
+		}
+	}
+
+	return app.Status.SourceType
+}
+
+// getApplicationSource returns the main source of a Helm or Kustomize type of the application
+func getApplicationSource(ctx context.Context, app *argocdapi.Application, wbc *WriteBackConfig) *argocdapi.ApplicationSource {
+	log := log.LoggerFromContext(ctx)
+	if app.Spec.HasMultipleSources() {
+		// Determine the source type from WriteBackConfig
+		sourceType := getApplicationSourceType(app, wbc)
+
+		for i := range app.Spec.Sources {
+			s := &app.Spec.Sources[i]
+			// If source type is Helm, look for Helm source
+			if sourceType == argocdapi.ApplicationSourceTypeHelm && s.Helm != nil {
+				return s
+			}
+			// If source type is Kustomize, look for Kustomize source
+			if sourceType == argocdapi.ApplicationSourceTypeKustomize && s.Kustomize != nil {
+				return s
+			}
+			// If source type is Plugin, look for Plugin source
+			if sourceType == argocdapi.ApplicationSourceTypePlugin && s.Plugin != nil {
+				return s
+			}
+		}
+
+		// Second pass: use Status.SourceTypes index alignment to handle implicit source types.
+		// ArgoCD sets Status.SourceTypes[i] for Spec.Sources[i], so a kustomize app that has no
+		// explicit kustomize: spec field (ArgoCD auto-detects it via kustomization.yaml) will be
+		// found here even though s.Kustomize == nil in the first pass above.
+		if sourceType != argocdapi.ApplicationSourceTypeDirectory &&
+			len(app.Status.SourceTypes) == len(app.Spec.Sources) {
+			for i, st := range app.Status.SourceTypes {
+				if st == sourceType {
+					return &app.Spec.Sources[i]
+				}
+			}
+		}
+
+		// Fallback: look for any Helm, Kustomize, or Plugin source
+		for i := range app.Spec.Sources {
+			s := &app.Spec.Sources[i]
+			if s.Helm != nil || s.Kustomize != nil || s.Plugin != nil {
+				return s
+			}
+		}
+
+		log.Tracef("Could not get Source of type Helm or Kustomize from multisource configuration. Returning first source from the list")
+		return &app.Spec.Sources[0]
+	}
+
+	// If the application uses a SourceHydrator, derive the source from its DrySource.
+	// The dry source is the write-back target: it holds the original (unhydrated) manifests.
+	// We construct the ApplicationSource manually (rather than using GetDrySource()) to
+	// include the Helm/Kustomize/Directory/Plugin fields, which downstream code relies on.
+	if app.Spec.SourceHydrator != nil {
+		ds := app.Spec.SourceHydrator.DrySource
+		source := argocdapi.ApplicationSource{
+			RepoURL:        ds.RepoURL,
+			Path:           ds.Path,
+			TargetRevision: ds.TargetRevision,
+			Helm:           ds.Helm,
+			Kustomize:      ds.Kustomize,
+			Directory:      ds.Directory,
+			Plugin:         ds.Plugin,
+		}
+		return &source
+	}
+
+	return app.Spec.Source
+}
+
+// persistSourceHydratorMutation writes Helm/Kustomize/Plugin mutations made on the
+// ApplicationSource returned by getApplicationSource back into the application's
+// SourceHydrator DrySource. For SourceHydrator apps, getApplicationSource returns a
+// pointer to a throwaway local copy (there is no single real ApplicationSource field
+// to alias), so any Set*Image call that assigns a brand-new Helm/Kustomize/Plugin
+// pointer into that copy would otherwise be silently discarded once the function
+// returns, and the mutation would never make it into the diff computed for write-back.
+// No-op for non-SourceHydrator apps. That covers both single-source apps, where
+// getApplicationSource returns a pointer straight into app.Spec.Source, and
+// multi-source apps, where it returns a pointer into app.Spec.Sources[i]; since
+// HasMultipleSources requires SourceHydrator == nil, the two cases never overlap.
+func persistSourceHydratorMutation(app *argocdapi.Application, appSource *argocdapi.ApplicationSource) {
+	if app.Spec.SourceHydrator == nil {
+		return
+	}
+	app.Spec.SourceHydrator.DrySource.Helm = appSource.Helm
+	app.Spec.SourceHydrator.DrySource.Kustomize = appSource.Kustomize
+	app.Spec.SourceHydrator.DrySource.Plugin = appSource.Plugin
+}

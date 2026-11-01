@@ -1,0 +1,335 @@
+## Command "run"
+
+### Synopsis
+
+`argocd-image-updater run [flags]`
+
+### Description
+
+Runs the Argo CD Image Updater in a reconciliation loop with a set of options. 
+
+### Flags
+
+**--acr-webhook-secret *secret***
+
+Secret for validating Azure ACR webhooks. ACR has no built-in signing, so the
+secret is sent as the `Authorization` header value, which you configure on the
+webhook with `az acr webhook update --headers "Authorization=<secret>"`.
+
+Can also be set with the `ACR_WEBHOOK_SECRET` environment variable.
+
+**--aliyun-acr-webhook-secret *secret***
+
+Secret for validating Aliyun ACR webhooks.
+
+Can also be set with the `ALIYUN_ACR_WEBHOOK_SECRET` environment variable.
+
+**--argocd-namespace *namespace***
+
+The namespace where Argo CD is running. Required only if the Image Updater runs in a different namespace than Argo CD.
+Defaults to the namespace the controller is running in.
+
+Can also be set with the `ARGOCD_NAMESPACE` environment variable.
+
+**--cloudevents-webhook-secret *secret***
+
+Secret for validating CloudEvents webhooks from AWS EventBridge and other CloudEvents sources.
+
+Can also be set with the `CLOUDEVENTS_WEBHOOK_SECRET` environment variable.
+
+**--disable-kube-events**
+
+Disable kubernetes events
+
+Can also be set with the *IMAGE_UPDATER_KUBE_EVENTS* environment variable.
+
+**--disable-tls**
+
+Disable TLS and run the webhook server with plain HTTP. By default, the server
+starts with TLS enabled.
+
+Can also be set with the `DISABLE_TLS` environment variable.
+
+**--dry-run**
+
+If this flag is set, Argo CD Image Updater won't actually perform any changes
+to workloads it found in need for upgrade.
+
+**--docker-webhook-secret *secret***
+
+Secret for validating Docker Hub webhooks.
+
+Can also be set with the `DOCKER_WEBHOOK_SECRET` environment variable.
+
+**--enable-http2 *disabled***
+
+If set, HTTP/2 will be enabled for the metrics and webhook servers.
+
+**--enable-webhook *enabled***
+
+Enable webhook server for receiving registry events.
+
+Can also be set with the `ENABLE_WEBHOOK` environment variable.
+
+**--ghcr-webhook-secret *secret***
+
+Secret for validating GitHub container registry webhooks.
+
+Can also be set with the `GHCR_WEBHOOK_SECRET` environment variable.
+
+**--git-commit-email *email***
+
+E-Mail address to use for Git commits (default "noreply@argoproj.io")
+
+Can also be set using the *GIT_COMMIT_EMAIL* environment variable.
+
+**--git-commit-message-path *path*** 
+
+Path to a template to use for Git commit messages (default "/app/config/commit.template")
+
+**--git-commit-method *method***
+
+Method used to create write-back commits ('git' or 'api'). The 'api' method creates the commit through the GitHub API using the repository's GitHub App credentials, so the commit is signed by GitHub and shows as "Verified". If the repository does not use GitHub App credentials, a warning is logged and the 'git' method is used instead. In 'api' mode the Git identity and signing options (--git-commit-user, --git-commit-email, --git-commit-signing-key, --git-commit-signing-method and --git-commit-sign-off) are ignored, because GitHub controls authorship and signing. (default "git")
+
+Can also be set using the *GIT_COMMIT_METHOD* environment variable.
+
+**--git-commit-sign-off**
+
+Whether to sign-off git commits
+
+**--git-commit-signing-key *key***
+
+GnuPG key ID or path to Private SSH Key used to sign the commits
+
+Can also be set using the *GIT_COMMIT_SIGNING_KEY* environment variable. 
+
+**--git-commit-signing-method *method*** 
+
+Method used to sign Git commits ('openpgp' or 'ssh') (default "openpgp")
+
+Can also be set using the *GIT_COMMIT_SIGNING_METHOD* environment variable.
+
+**--git-commit-user *user***
+
+Username to use for Git commits (default "argocd-image-updater")
+
+Can also be set using the *GIT_COMMIT_USER* environment variable.
+
+**--harbor-webhook-secret *secret***
+
+Secret for validating Harbor webhooks
+
+Can also be set with the `HARBOR_WEBHOOK_SECRET` environment variable.
+
+**--health-probe-bind-address *port***
+
+Specifies the local port to bind the health server to. The health server is
+used to provide health and readiness probes when running as K8s workload.
+Use value *0* for *port* to disable launching the health server.
+
+**-h, --help**
+
+help for run
+
+**--interval *duration***
+
+Sets the interval for checking whether there are new images available to
+*duration*. *duration* must be given as a valid duration identifier with
+a unit suffix, i.e. `2m` for 2 minutes or `30s` for 30 seconds. If no unit
+is given, milliseconds will be assumed. If set to `0`, ArgoCD Image Updater
+will run the reconciliation once and stop for that specific ImageUpdater CR,
+effectively disabling the interval for that resource. Default
+value is `2m0s`.
+
+Can also be set using the *IMAGE_UPDATER_INTERVAL* environment variable.
+The `--interval` flag takes precedence over the `IMAGE_UPDATER_INTERVAL` environment variable.
+
+The order of precedence for determining the update interval is as follows:
+
+1.  **`--interval` flag:** If the `--interval` command-line flag is provided, its value will be used.
+2.  **`IMAGE_UPDATER_INTERVAL` environment variable:** If the `--interval` flag is not set, the value of the `IMAGE_UPDATER_INTERVAL` environment variable will be used.
+3.  **Default value:** If neither the `--interval` flag nor the `IMAGE_UPDATER_INTERVAL` environment variable is set, the default value will be used.
+
+**--kubeconfig *path***
+
+Specify the Kubernetes client config file to use when running outside a
+Kubernetes cluster, i.e. `~/.kube/config`. When specified, Argo CD Image
+Updater will use the currently active context in the configuration to connect
+to the Kubernetes cluster.
+
+**--leader-election *enabled***
+
+Enable leader election for controller manager. Enabling this will ensure 
+there is only one active controller manager.
+
+**--leader-election-namespace *namespace***
+
+The namespace used for the leader election lease. If empty, the controller will
+use the namespace of the pod it is running in. When running locally this value must be set.
+
+!!!warning "Non-default lease namespace requires manual RBAC"
+    The `argocd-image-updater-leader-election-role` `Role` and its `RoleBinding`
+    are created only once, in the controller's own namespace, by the installation
+    manifests. If `--leader-election-namespace` is set to any other namespace,
+    those resources must be created there manually — the controller will fail to
+    acquire the leadership lease without them. This is independent of
+    `--watch-namespaces`: including a namespace in the watch list does **not**
+    create the leader election `Role`/`RoleBinding` there. Leave
+    `--leader-election-namespace` empty to use the pod's own namespace and avoid
+    this requirement.
+
+**--loglevel *level***
+
+Set the log level to *level*, where *level* can be one of `trace`, `debug`,
+`info`, `warn` or `error`.
+
+Can also be set using the *IMAGE_UPDATER_LOGLEVEL* environment variable.
+
+**--logformat *format***
+
+Set the log format to *format*, where *format* can be one of `text` or `json`
+
+Can also be set using the *IMAGE_UPDATER_LOGFORMAT* environment variable.
+
+**--max-concurrent-apps *number***
+
+Process a maximum of *number* applications concurrently. To disable concurrent
+application processing, specify a number of `1`.
+
+Can also be set using the *MAX_CONCURRENT_APPS* environment variable.
+
+**--max-concurrent-reconciles *number***
+
+Process a maximum of *number* ImageUpdater custom resources concurrently. 
+This controls how many ImageUpdater CRs can be reconciled simultaneously by the controller. 
+To disable concurrent reconciliation processing, specify a number of 1. 
+Higher values may improve throughput but could increase resource usage and API load.
+
+Can also be set using the *MAX_CONCURRENT_RECONCILES* environment variable.
+
+**--metrics-bind-address *port***
+
+port to start the metrics server on, "0" to disable (default "0")
+
+**--metrics-secure *enabled***
+
+If set, the metrics endpoint is served securely via HTTPS. Use `--metrics-secure="false"` to use HTTP instead.
+
+**--once**
+
+A shortcut for specifying `--interval 0 --health-probe-bind-address 0 --warmUpCache=true`. If given,
+Argo CD Image Updater will exit after the first update cycle.
+
+**--quay-webhook-secret *secret***
+
+Secret for validating Quay webhooks.
+
+Can also be set with the `QUAY_WEBHOOK_SECRET` environment variable.
+
+**--registries-conf-path *path***
+
+Load the registry configuration from file at *path*. Defaults to the path
+`/app/config/registries.conf`. If no configuration should be loaded, and the
+default configuration should be used instead, specify the empty string, i.e.
+`--registries-conf-path=""`.
+
+**--tls-cert-path *path***
+
+Path to the TLS certificate file for the webhook server. Defaults to
+`/app/config/webhook/tls/tls.crt`. When neither this flag nor `--tls-key-path`
+is changed and the default location holds no keypair, a keypair at the previous default
+location `/app/config/tls/tls.crt` and `/app/config/tls/tls.key` is used instead, with a
+deprecation warning. When either flag is changed, the server fails to start unless a
+usable keypair exists at the paths given.
+
+Can also be set with the `TLS_CERT_PATH` environment variable.
+
+**--tls-key-path *path***
+
+Path to the TLS private key file for the webhook server. Defaults to
+`/app/config/webhook/tls/tls.key`.
+
+Can also be set with the `TLS_KEY_PATH` environment variable.
+
+**--tlsciphers *suites***
+
+Colon-separated list of TLS cipher suite names to allow (e.g.
+`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`).
+Only applies to TLS 1.1 and 1.2 connections; TLS 1.3 cipher suites are not configurable.
+Defaults to the Go standard library's secure defaults.
+
+Can also be set with the `TLS_CIPHERS` environment variable.
+
+**--tlscurvepreferences *groups***
+
+Colon-separated list of allowed TLS key exchange groups (e.g. `X25519:CurveP256`).
+This selects which groups are enabled; list order is ignored — Go chooses from the
+set using its internal preference order. Supported values are `X25519MLKEM768`,
+`SecP256r1MLKEM768`, `SecP384r1MLKEM1024`, `X25519`, `CurveP256`,
+`CurveP384`, and `CurveP521`. The hybrid post-quantum groups (`X25519MLKEM768`,
+`SecP256r1MLKEM768`, `SecP384r1MLKEM1024`) are TLS 1.3-only; `crypto/tls` ignores
+them for lower negotiated versions.
+Defaults to the Go standard library's secure defaults.
+
+Can also be set with the `TLS_CURVE_PREFERENCES` environment variable.
+
+**--tlsmaxversion *version***
+
+Maximum TLS version to accept. Valid values are `1.1`, `1.2`, and `1.3`. Defaults to `1.3`.
+
+Can also be set with the `TLS_MAX_VERSION` environment variable.
+
+**--tlsminversion *version***
+
+Minimum TLS version to accept. Valid values are `1.1`, `1.2`, and `1.3`. Defaults to `1.3`.
+TLS 1.0 is not supported: a configured minimum of `1.0` is clamped up to `1.2` with a warning,
+so the server still starts but never negotiates TLS 1.0.
+
+Can also be set with the `TLS_MIN_VERSION` environment variable.
+
+**--warmup-cache**
+
+whether to perform a cache warm-up on startup (default true)
+
+**--watch-namespaces *namespace-list***
+
+Controls which namespaces the controller watches for ImageUpdater CRs:
+
+- **Not set** (default): controller's own namespace only. Requires Role+RoleBinding in that namespace.
+- **`*`**: all namespaces, cluster-scoped. Requires ClusterRole+ClusterRoleBinding.
+- **`ns1,ns2,...`**: specific namespaces. Requires Role+RoleBinding in each namespace.
+
+Example: `--watch-namespaces=argocd,team-a,team-b`
+
+Can also be set with the `IMAGE_UPDATER_WATCH_NAMESPACES` environment variable.
+
+**--webhook-port *port***
+
+Port to listen on for webhook events (default 8082)
+
+Can also be set with the `WEBHOOK_PORT` environment variable.
+
+**--webhook-ratelimit-allowed *numRequests***
+
+The number of allowed requests in an hour for webhook rate limiting, setting to 0
+means that the rate limiting is disabled.
+
+Can also be set with the `WEBHOOK_RATELIMIT_ALLOWED` environment variable.
+
+**--webhook-require-secret *bool***
+
+When set to `true` (the default), only registry webhook handlers that have a
+secret configured are registered. Requests arriving for a registry with no
+secret will be rejected. Set to `false` to register all handlers regardless
+of whether a secret is present — this disables authentication on those
+endpoints and is strongly discouraged in production.
+
+Can also be set with the `WEBHOOK_REQUIRE_SECRET` environment variable.
+
+!!!warning
+    Setting `--webhook-require-secret=false` means the webhook endpoint will
+    accept unauthenticated requests from any source for registries that have no
+    secret configured. Only use this during local development or in a fully
+    network-isolated environment.
+
+[label selector syntax]: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors

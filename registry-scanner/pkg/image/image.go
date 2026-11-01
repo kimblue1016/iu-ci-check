@@ -1,0 +1,392 @@
+package image
+
+import (
+	"strings"
+	"time"
+
+	"github.com/distribution/reference"
+	"github.com/sirupsen/logrus"
+
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/log"
+	"github.com/argoproj-labs/argocd-image-updater/registry-scanner/pkg/tag"
+)
+
+// ContainerImage represents a container image.
+type ContainerImage struct {
+	RegistryURL    string
+	ImageName      string
+	ImageTag       *tag.ImageTag
+	ImageAlias     string
+	KustomizeImage *ContainerImage
+
+	original string
+}
+
+type ContainerImageList []*ContainerImage
+
+// NewFromIdentifier parses an image identifier and returns a populated ContainerImage
+func NewFromIdentifier(identifier string) *ContainerImage {
+	imgRef := identifier
+	alias := ""
+	if strings.Contains(identifier, "=") {
+		n := strings.SplitN(identifier, "=", 2)
+		imgRef = n[1]
+		alias = n[0]
+	}
+	if parsed, err := reference.ParseNormalizedNamed(imgRef); err == nil {
+		img := ContainerImage{}
+		domain := reference.Domain(parsed)
+		img.RegistryURL = domain
+		// remove default registry for backwards-compatibility
+		if img.RegistryURL == "docker.io" && !strings.HasPrefix(imgRef, "docker.io") {
+			img.RegistryURL = ""
+		}
+		img.ImageAlias = alias
+		img.ImageName = reference.Path(parsed)
+		// Docker Hub images without a namespace get the implicit library/
+		// namespace from normalization, e.g. nginx becomes docker.io/library/nginx.
+		// Remove that namespace again. Other registries use library/ as a normal
+		// path element, so keep it there.
+		if domain == "docker.io" && !strings.HasPrefix(imgRef, "library/") {
+			img.ImageName = strings.TrimPrefix(img.ImageName, "library/")
+		}
+		// Check for both tag and digest - an image can have both (e.g., image:tag@sha256:...)
+		// We need to handle both cases, not use else-if which would miss the tag when digest is present
+		if digested, ok := parsed.(reference.Digested); ok {
+			img.ImageTag = &tag.ImageTag{
+				TagDigest: string(digested.Digest()),
+			}
+			// Also check if there's a tag along with the digest
+			if tagged, ok := parsed.(reference.Tagged); ok {
+				img.ImageTag.TagName = tagged.Tag()
+			}
+		} else if tagged, ok := parsed.(reference.Tagged); ok {
+			img.ImageTag = &tag.ImageTag{
+				TagName: tagged.Tag(),
+			}
+		}
+		img.original = identifier
+		return &img
+	}
+
+	// if distribution couldn't parse it, fall back to the legacy parsing logic
+	img := ContainerImage{}
+	img.RegistryURL = getRegistryFromIdentifier(identifier)
+	img.ImageAlias, img.ImageName, img.ImageTag = getImageTagFromIdentifier(identifier)
+	img.original = identifier
+	return &img
+}
+
+// String returns the string representation of given ContainerImage
+func (img *ContainerImage) String() string {
+	str := ""
+	if img.ImageAlias != "" {
+		str += img.ImageAlias
+		str += "="
+	}
+	str += img.GetFullNameWithTag()
+	return str
+}
+
+func (img *ContainerImage) GetFullNameWithoutTag() string {
+	str := ""
+	if img.RegistryURL != "" {
+		if !strings.HasPrefix(img.ImageName, img.RegistryURL+"/") {
+			str += img.RegistryURL + "/"
+		}
+	}
+	str += img.ImageName
+	return str
+}
+
+// GetFullNameWithTag returns the complete image slug, including the registry
+// and any tag digest or tag name set for the image.
+func (img *ContainerImage) GetFullNameWithTag() string {
+	str := ""
+	if img.RegistryURL != "" {
+		if !strings.HasPrefix(img.ImageName, img.RegistryURL+"/") {
+			str += img.RegistryURL + "/"
+		}
+	}
+	str += img.ImageName
+	if img.ImageTag != nil {
+		if img.ImageTag.TagName != "" {
+			str += ":"
+			str += img.ImageTag.TagName
+		}
+		if img.ImageTag.TagDigest != "" {
+			str += "@"
+			str += img.ImageTag.TagDigest
+		}
+	}
+	return str
+}
+
+// GetTagWithDigest returns tag name along with any tag digest set for the image
+func (img *ContainerImage) GetTagWithDigest() string {
+	str := ""
+	if img.ImageTag != nil {
+		if img.ImageTag.TagName != "" {
+			str += img.ImageTag.TagName
+		}
+		if img.ImageTag.TagDigest != "" {
+			if str == "" {
+				str += "latest"
+			}
+			str += "@"
+			str += img.ImageTag.TagDigest
+		}
+	}
+	return str
+}
+
+func (img *ContainerImage) Original() string {
+	return img.original
+}
+
+// IsUpdatable checks whether the given image can be updated with newTag while
+// taking tagSpec into account. tagSpec must be given as a semver compatible
+// version spec, i.e. ^1.0 or ~2.1
+func (img *ContainerImage) IsUpdatable(newTag, tagSpec string) bool {
+	return false
+}
+
+// WithTag returns a copy of img with new tag information set
+func (img *ContainerImage) WithTag(newTag *tag.ImageTag) *ContainerImage {
+	nimg := &ContainerImage{}
+	nimg.RegistryURL = img.RegistryURL
+	nimg.ImageName = img.ImageName
+	nimg.ImageTag = newTag
+	nimg.ImageAlias = img.ImageAlias
+	return nimg
+}
+
+func (img *ContainerImage) DiffersFrom(other *ContainerImage, checkVersion bool) bool {
+	return img.RegistryURL != other.RegistryURL || img.ImageName != other.ImageName || (checkVersion && img.ImageTag.TagName != other.ImageTag.TagName)
+}
+
+// ContainsImage checks whether img is contained in a list of images
+func (list *ContainerImageList) ContainsImage(img *ContainerImage, checkVersion bool) *ContainerImage {
+	// if there is a KustomizeImage override, check it for a match first
+	if img.KustomizeImage != nil {
+		if kustomizeMatch := list.ContainsImage(img.KustomizeImage, checkVersion); kustomizeMatch != nil {
+			return kustomizeMatch
+		}
+	}
+	for _, image := range *list {
+		if img.ImageName == image.ImageName && image.RegistryURL == img.RegistryURL {
+			if !checkVersion || image.ImageTag.TagName == img.ImageTag.TagName {
+				return image
+			}
+		}
+	}
+	return nil
+}
+
+// MatchForDigestUpdate returns the live image that best represents the container
+// tracked by img, for digest-strategy update evaluation, when several containers
+// in the application share the same image name. It returns nil when there is no
+// better candidate than the caller's existing lookup.
+//
+// Argo CD's Status.Summary.Images (the source of the live image list) is
+// alias-less and deduplicated by full reference, so a plain ContainsImage lookup
+// (name + registry only, first match) can return a sibling container's live
+// image and either hide the tracked container's pending update or trigger a
+// spurious one. This narrows the match in two steps:
+//
+//  1. Prefer a live image whose tag name also matches img's tag name. This
+//     disambiguates aliases that share an image name but track different tags
+//     (e.g. tag-a vs tag-b), so each alias is evaluated against its own
+//     container instead of a sibling's.
+//  2. Among the candidates, prefer one whose digest differs from latestDigest —
+//     a container still on an older digest that needs updating. This
+//     disambiguates several containers that share both image name and tag (e.g.
+//     two deployments both on :develop) once their digests diverge.
+//
+// If no live image carries img's tag name (e.g. the summary lists digests
+// without tags), it falls back to a stale name+registry match, preserving the
+// previous name-only behavior.
+func (list *ContainerImageList) MatchForDigestUpdate(img *ContainerImage, latestDigest string) *ContainerImage {
+	wantTag := ""
+	if img.ImageTag != nil {
+		wantTag = img.ImageTag.TagName
+	}
+
+	var firstTagMatch, staleNameMatch *ContainerImage
+	for _, live := range *list {
+		if img.ImageName != live.ImageName || img.RegistryURL != live.RegistryURL {
+			continue
+		}
+		isStale := live.ImageTag != nil && live.ImageTag.IsDigest() && live.ImageTag.TagDigest != latestDigest
+		if isStale && staleNameMatch == nil {
+			staleNameMatch = live
+		}
+		if wantTag != "" && live.ImageTag != nil && live.ImageTag.TagName == wantTag {
+			if isStale {
+				// Same tag and still stale: this is exactly the container to update.
+				return live
+			}
+			if firstTagMatch == nil {
+				firstTagMatch = live
+			}
+		}
+	}
+
+	// Same tag but already current: return it so the caller evaluates this exact
+	// container (and correctly finds it up to date) rather than a sibling.
+	if firstTagMatch != nil {
+		return firstTagMatch
+	}
+	// No tag match available: fall back to a stale name+registry match if any.
+	return staleNameMatch
+}
+
+func (list *ContainerImageList) Originals() []string {
+	results := make([]string, len(*list))
+	for i, img := range *list {
+		results[i] = img.Original()
+	}
+	return results
+}
+
+// String Returns the name of all images as a string, separated using comma
+func (list *ContainerImageList) String() string {
+	imgNameList := make([]string, 0)
+	for _, image := range *list {
+		imgNameList = append(imgNameList, image.String())
+	}
+	return strings.Join(imgNameList, ",")
+}
+
+// Gets the registry URL from an image identifier
+func getRegistryFromIdentifier(identifier string) string {
+	var imageString string
+	comp := strings.Split(identifier, "=")
+	if len(comp) > 1 {
+		imageString = comp[1]
+	} else {
+		imageString = identifier
+	}
+	comp = strings.Split(imageString, "/")
+	if len(comp) > 1 && strings.Contains(comp[0], ".") {
+		return comp[0]
+	} else {
+		return ""
+	}
+}
+
+// Gets the image name and tag from an image identifier
+func getImageTagFromIdentifier(identifier string) (string, string, *tag.ImageTag) {
+	var imageString string
+	var sourceName string
+
+	// The original name is prepended to the image name, separated by =
+	comp := strings.SplitN(identifier, "=", 2)
+	if len(comp) == 2 {
+		sourceName = comp[0]
+		imageString = comp[1]
+	} else {
+		imageString = identifier
+	}
+
+	// Strip any repository identifier from the string
+	comp = strings.Split(imageString, "/")
+	if len(comp) > 1 && strings.Contains(comp[0], ".") {
+		imageString = strings.Join(comp[1:], "/")
+	}
+
+	// We can either have a tag name or a digest reference, or both
+	// jannfis/test-image:0.1
+	// gcr.io/jannfis/test-image:0.1
+	// gcr.io/jannfis/test-image@sha256:abcde
+	// gcr.io/jannfis/test-image:test-tag@sha256:abcde
+	if strings.Contains(imageString, "@") {
+		comp = strings.SplitN(imageString, "@", 2)
+		colonPos := strings.LastIndex(comp[0], ":")
+		slashPos := strings.LastIndex(comp[0], "/")
+		if colonPos > slashPos {
+			// first half (before @) contains image and tag name
+			return sourceName, comp[0][:colonPos], tag.NewImageTag(comp[0][colonPos+1:], time.Unix(0, 0), comp[1])
+		} else {
+			// first half contains image name without tag name
+			return sourceName, comp[0], tag.NewImageTag("", time.Unix(0, 0), comp[1])
+		}
+	} else {
+		comp = strings.SplitN(imageString, ":", 2)
+		if len(comp) != 2 {
+			return sourceName, imageString, nil
+		} else {
+			tagName, tagDigest := getImageDigestFromTag(comp[1])
+			return sourceName, comp[0], tag.NewImageTag(tagName, time.Unix(0, 0), tagDigest)
+		}
+	}
+}
+
+func getImageDigestFromTag(tagStr string) (string, string) {
+	a := strings.Split(tagStr, "@")
+	if len(a) != 2 {
+		return tagStr, ""
+	} else {
+		return a[0], a[1]
+	}
+}
+
+// HasRegistryPrefix checks if an image name is in long form (has a registry URL prefix).
+// A long form image name has a registry URL like "docker.io/bitnami/nginx" or "gcr.io/myproject/image".
+// A short form is like "bitnami/nginx".
+func HasRegistryPrefix(imageName string) bool {
+	parts := strings.Split(imageName, "/")
+	if len(parts) > 1 {
+		// Check if the first part contains a dot, which indicates it's a registry domain
+		return strings.Contains(parts[0], ".")
+	}
+	return false
+}
+
+// ExtractShortForm extracts the short form from a long form image name by removing the registry prefix.
+// For example, "docker.io/bitnami/nginx" becomes "bitnami/nginx".
+// If the image is already in short form, it returns the original string.
+func ExtractShortForm(imageName string) string {
+	if !HasRegistryPrefix(imageName) {
+		return imageName
+	}
+	parts := strings.SplitN(imageName, "/", 2)
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return imageName
+}
+
+// LogContext returns a log context for the given image, with required fields
+// set to the image's information.
+func (img *ContainerImage) LogContext() *log.LogContext {
+	logCtx := log.WithContext()
+	logCtx.AddField("image_name", img.GetFullNameWithoutTag())
+	logCtx.AddField("image_alias", img.ImageAlias)
+	logCtx.AddField("registry_url", img.RegistryURL)
+	if img.ImageTag != nil {
+		logCtx.AddField("image_tag", img.ImageTag.TagName)
+		logCtx.AddField("image_digest", img.ImageTag.TagDigest)
+	}
+	return logCtx
+}
+
+// GetLogFields returns a map of structured log fields for the image.
+func (img *ContainerImage) GetLogFields(alias string) logrus.Fields {
+	fields := logrus.Fields{
+		"image_registry": img.RegistryURL,
+		"image_name":     img.GetFullNameWithoutTag(),
+	}
+	if alias != "" {
+		fields["image_alias"] = alias
+	}
+	if imageTag := img.ImageTag; imageTag != nil {
+		if imageTag.TagName != "" {
+			fields["image_tag"] = imageTag.TagName
+		}
+		if imageTag.TagDigest != "" {
+			fields["image_digest"] = imageTag.TagDigest
+		}
+	}
+	return fields
+}

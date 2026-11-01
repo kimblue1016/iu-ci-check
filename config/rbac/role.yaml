@@ -1,0 +1,48 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-image-updater-manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+- apiGroups:
+  - argocd-image-updater.argoproj.io
+  resources:
+  - imageupdaters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - argocd-image-updater.argoproj.io
+  resources:
+  - imageupdaters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - argocd-image-updater.argoproj.io
+  resources:
+  - imageupdaters/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - argoproj.io
+  resources:
+  - applications
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
